@@ -342,6 +342,14 @@ dpg.create_context()
 dpg.create_viewport()
 dpg.setup_dearpygui()
 
+
+with dpg.font_registry():
+    # Download font here: https://fonts.google.com/specimen/Open+Sans
+    font = dpg.add_font("OpenSans-VariableFont_wdth,wght.ttf", 15, tag="ttf-font"
+    )
+
+dpg.bind_font(font)
+
 load_model(the_name="distilgpt2")
 #edit_string_callback("This is an example")
 
@@ -434,6 +442,7 @@ with dpg.window(tag = "main_window", label="CTGS - Contrained Text Generation St
     dpg.add_input_text(tag = "string", width = 500, height = 500, multiline=True, default_value = "Type something here!")
     dpg.add_button(label="Predict New Tokens", callback=edit_string_callback)
 edit_string_callback()
+dpg.set_global_font_scale(1.0)
 
 dpg.show_viewport()
 dpg.start_dearpygui()
