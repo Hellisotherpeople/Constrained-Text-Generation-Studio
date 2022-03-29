@@ -86,12 +86,13 @@ def starts_with(word, starting_string, start = None, end = None):
     else:
         return False
 
-def string_in_position(word, a_string, position_index):
-    if len(word[0]) > position_index:
-        if word[0][position_index] == a_string:
-            return True 
-    else:
-        return False
+def string_in_position(word, a_string_list, position_index_list):
+    for idx, string in enumerate(a_string_list):
+        location_in_word = position_index_list[idx]
+        if len(word[0]) > location_in_word:
+            if word[0][location_in_word] != string:
+                    return False
+    return True
 
 def palindrome(word):
     the_string = word[0]
@@ -130,8 +131,10 @@ def reverse_isogram(word, count = 1):
 
 Ideas 
 
-Longest repeating and non overlapping substring in a string
+1. Longest repeating and non overlapping substring in a string
+2. List of strings to consume from, like a pangram but you specify the alphabet
 
+Leetcode stuff like this
 
 Find longest palindroming substring
 def countSubstrings(self, s: str) -> int:
@@ -163,6 +166,8 @@ lipogram_naughty_word_list = []
 weak_lipogram_naughty_word_list = []
 reverse_lipogram_nice_word_list = []
 weak_reverse_lipogram_nice_word_list = []
+string_in_positon_list = []
+string_in_positon_index_list = []
 
 """
         if alpha_numaric_transform:
@@ -228,6 +233,9 @@ def get_next_word_without_e(sequence):
                 return_word = False 
         if len(weak_reverse_lipogram_nice_word_list) > 0:
             if not any_letters_included(word=word, string_list = weak_reverse_lipogram_nice_word_list):
+                return_word = False
+        if len(string_in_positon_list) > 0:
+            if not string_in_position(word=word, a_string_list=string_in_positon_list, position_index_list=string_in_positon_index_list):
                 return_word = False
         if return_word == True:
             all_letters_filtered_list.append(word)
@@ -338,6 +346,28 @@ def load_weak_reverse_naughty_strings_callback():
         dpg.set_value(item = "weak_reverse_nice_filter", value = "Weak Nice Strings Filter: " + string_input)
     edit_string_callback()
 
+def string_position_callback(sender, app_data, user_data):
+    if app_data == True:
+        dpg.show_item("Letter Position Options")
+    else:
+        dpg.hide_item("Letter Position Options")
+
+def load_string_positon_callback():
+    global string_in_positon_list
+    global string_in_positon_index_list
+    string_input = dpg.get_value("string_for_position")
+    int_input = dpg.get_value("string_position_int")
+    string_in_positon_list = string_input.split(" ")
+    string_in_positon_index_list = int_input.split(" ")
+    string_in_positon_index_list = [int(i) for i in string_in_positon_index_list]
+    if not dpg.get_value("string_postion_applied"):
+        dpg.add_text(tag = "string_postion_applied", default_value= "Strings in Position Applied!", parent = "Letter Position Options")
+        dpg.add_text(tag = "string_postion_filter" , default_value = "Strings in Position Applied:  " + string_input + " " + str(int_input), parent = "main_window", before = "lipogram")
+    else:
+        dpg.set_value(item = "string_postion_filter", value = "Strings in Position Filter: " + string_input + " " + str(int_input))
+    edit_string_callback()
+
+
 dpg.create_context()
 dpg.create_viewport()
 dpg.setup_dearpygui()
@@ -363,14 +393,14 @@ with dpg.window(tag = "main_window", label="CTGS - Contrained Text Generation St
     dpg.add_text("List of enabled filters: ")
     dpg.add_checkbox(tag="lipogram", label = "All Strings Banned", callback=lipogram_callback)
 
-    with dpg.child_window(tag="Lipogram Options", show = False, height = 100, width = 500) as lipogram_selection_window:
+    with dpg.child_window(tag="Lipogram Options", show = False, height = 100, width = 600) as lipogram_selection_window:
         dpg.add_text("Add naughty letters or strings seperated by a space!")
         dpg.add_input_text(tag = "lipogram_word_list", width = 500, height = 500, label = "Banned Strings")
         dpg.add_button(tag="lipogram_button", label="Load Banned Strings", callback=load_naughty_strings_callback)
 
     dpg.add_checkbox(tag="weak_lipogram", label = "Any Strings Banned", callback=weak_lipogram_callback)
 
-    with dpg.child_window(tag="Weak Lipogram Options", show = False, height = 100, width = 500) as weak_lipogram_selection_window:
+    with dpg.child_window(tag="Weak Lipogram Options", show = False, height = 100, width = 600) as weak_lipogram_selection_window:
         dpg.add_text("Add naughty letters or strings seperated by a space!")
         dpg.add_input_text(tag = "weak_lipogram_word_list", width = 500, height = 500, label = "Banned Strings")
         dpg.add_button(tag="weak_lipogram_button", label="Load Banned Strings", callback = load_weak_naughty_strings_callback)
@@ -378,50 +408,52 @@ with dpg.window(tag = "main_window", label="CTGS - Contrained Text Generation St
 
     dpg.add_checkbox(tag="reverse_lipogram", label = "All Strings Required", callback=reverse_lipogram_callback)
 
-    with dpg.child_window(tag="Reverse Lipogram Options", show = False, height = 100, width = 500) as reverse_lipogram_selection_window:
+    with dpg.child_window(tag="Reverse Lipogram Options", show = False, height = 100, width = 600) as reverse_lipogram_selection_window:
         dpg.add_text("Add nice letters or strings seperated by a space!")
         dpg.add_input_text(tag = "reverse_lipogram_word_list", width = 500, height = 500, label = "Forced Strings")
         dpg.add_button(tag="reverse_lipogram_button", label="Load Forced Strings", callback = load_reverse_naughty_strings_callback)
 
     dpg.add_checkbox(tag="weak_reverse_lipogram", label = "Any Strings Required", callback=weak_reverse_lipogram_callback)
 
-    with dpg.child_window(tag="Weak Reverse Lipogram Options", show = False, height = 100, width = 500) as weak_reverse_selection_window:
+    with dpg.child_window(tag="Weak Reverse Lipogram Options", show = False, height = 100, width = 600) as weak_reverse_selection_window:
         dpg.add_text("Add nice letters or strings seperated by a space!")
         dpg.add_input_text(tag = "weak_reverse_lipogram_word_list", width = 500, height = 500, label = "Forced Strings")
         dpg.add_button(tag="weak_reverse_lipogram_button", label="Load Forced Strings", callback = load_weak_reverse_naughty_strings_callback)
 
-    dpg.add_checkbox(tag="string_position", label = "String In Position")
+    dpg.add_checkbox(tag="string_position", label = "String In Position", callback = string_position_callback)
 
-    with dpg.child_window(tag="Letter Position Options", show = False, height = 100, width = 500) as letter_position_selection_window:
-        dpg.add_text("Add the position that you want to force a particular letter to appear at!")
-        dpg.add_input_text(tag = "string_for_position", width = 500, height = 500, label = "String to include at position")
-        dpg.add_input_int(tag = "string_position_int", label = "Position in string to force letter to be at")
-        dpg.add_button(tag="string_position_button", label="Load Strings")
+    with dpg.child_window(tag="Letter Position Options", show = False, height = 130, width = 600) as letter_position_selection_window:
+        dpg.add_text("WARNING: This is a bit slow!")
+        dpg.add_text("Add the position that you want to force a particular letter to appear at! Give a list of characters seperated by a space")
+        dpg.add_input_text(tag = "string_for_position", width = 500, height = 500, label = "List of characters")
+        dpg.add_text("Corresponding list of indexes for each character. Must be the same length as the list of characters")
+        dpg.add_input_text(tag = "string_position_int", width = 500, height = 500, label = "List of indexes")
+        dpg.add_button(tag="string_position_button", label="Load Strings", callback = load_string_positon_callback)
 
     dpg.add_checkbox(tag="string_starts", label = "String Starts With")
 
-    with dpg.child_window(tag="Starting Starts With Options", show = False, height = 100, width = 500) as starting_string_selection_window:
+    with dpg.child_window(tag="Starting Starts With Options", show = False, height = 100, width = 600) as starting_string_selection_window:
         dpg.add_text("Add the string that the word should start with")
         dpg.add_input_text(tag = "string_start_word", width = 500, height = 500, label = "String for word to start with")
         dpg.add_button(tag="string_start_button", label="Load Starting String", callback=load_naughty_strings_callback)
 
     dpg.add_checkbox(tag="string_ends", label = "String Ends With")
 
-    with dpg.child_window(tag="Starting Ends With Options", show = False, height = 100, width = 500) as ending_string_selection_window:
+    with dpg.child_window(tag="Starting Ends With Options", show = False, height = 100, width = 600) as ending_string_selection_window:
         dpg.add_text("Add the string that the word should end with")
         dpg.add_input_text(tag = "string_end_word", width = 500, height = 500, label = "String for word to end with")
         dpg.add_button(tag="string_end_button", label="Load Ending String", callback=load_naughty_strings_callback)
 
     dpg.add_checkbox(tag="length_constrained", label = "String Length Equal To")
 
-    with dpg.child_window(tag="Length Constrained Options", show = False, height = 100, width = 500) as length_constrained_selection_window:
+    with dpg.child_window(tag="Length Constrained Options", show = False, height = 100, width = 600) as length_constrained_selection_window:
         dpg.add_text("Specify the length that you want your strings to be constrained to")
         dpg.add_input_int(tag = "length_constrained_number", label = "Number to constrain the length with")
         dpg.add_button(tag="length_constrained_button", label="Load Length Constrained String", callback=load_naughty_strings_callback)
 
     dpg.add_checkbox(tag="length_gt", label = "String Length Greater Than")
 
-    with dpg.child_window(tag="Length Greater Than Options", show = False, height = 100, width = 500) as length_gt_selection_window:
+    with dpg.child_window(tag="Length Greater Than Options", show = False, height = 100, width = 600) as length_gt_selection_window:
         dpg.add_text("Specify the length that you want your strings to be greater than")
         dpg.add_input_int(tag = "length_gt_constrained_number", label = "Number to constrain the length to be greater than")
         dpg.add_button(tag="length_gt_constrained_button", label="Load Length Constrained String", callback=load_naughty_strings_callback)
@@ -429,7 +461,7 @@ with dpg.window(tag = "main_window", label="CTGS - Contrained Text Generation St
 
     dpg.add_checkbox(tag="length_lt", label = "String Length Lesser Than")
 
-    with dpg.child_window(tag="Length Lesser Than Options", show = False, height = 100, width = 500) as length_lt_selection_window:
+    with dpg.child_window(tag="Length Lesser Than Options", show = False, height = 100, width = 600) as length_lt_selection_window:
         dpg.add_text("Specify the length that you want your strings to be lesser than")
         dpg.add_input_int(tag = "length_lt_constrained_number", label = "Number to constrain the length to be lesser than")
         dpg.add_button(tag="length_lt_constrained_button", label="Load Length Constrained String", callback=load_naughty_strings_callback)
