@@ -153,15 +153,16 @@ number_of_tokens_to_sample = 25000
 replace_spaces = False
 selection_window = False
 upper_case_transform = False
-lower_case_transform = False
+lower_case_transform = True
 lstrip_transform = False 
 rstrip_transform = False
 strip_transform = False
 capitalize_first_letter_transform = False
 alpha_numaric_transform = False 
-alpha_transform = False
+alpha_transform = True
 digit_transform = False 
 ascii_transform = False
+filter_blank_outputs = True
 
 lipogram_naughty_word_list = []
 weak_lipogram_naughty_word_list = []
@@ -171,18 +172,12 @@ string_in_positon_list = []
 string_in_positon_index_list = []
 starts_with_string = ""
 ends_with_string = ""
+constrained_length = 0
+constrained_gt_length = 0
+constrained_lt_length = 0
+palindrome_enabled = False
 
 
-"""
-        if alpha_numaric_transform:
-            resulting_string = ''.join(ch for ch in resulting_string g if ch.isalnum())
-        if alpha_transform:
-            resulting_string = ''.join(ch for ch in resulting_string g if ch.isalpha())
-        if digit_transform:
-            resulting_string = ''.join(ch for ch in resulting_string g if ch.isdigit())
-        if ascii_transform:
-            resulting_string = ''.join(ch for ch in resulting_string g if ch.isascii())
-"""
 
 
 def get_next_word_without_e(sequence):
@@ -220,6 +215,17 @@ def get_next_word_without_e(sequence):
             resulting_string = resulting_string.strip()
         if capitalize_first_letter_transform:
             resulting_string = resulting_string.capitalize()
+        if alpha_numaric_transform:
+            resulting_string = ''.join(ch for ch in resulting_string if ch.isalnum())
+        if alpha_transform:
+            resulting_string = ''.join(ch for ch in resulting_string if ch.isalpha())
+        if digit_transform:
+            resulting_string = ''.join(ch for ch in resulting_string if ch.isdigit())
+        if ascii_transform:
+            resulting_string = ''.join(ch for ch in resulting_string if ch.isascii())
+        if filter_blank_outputs:
+            if resulting_string == "":
+                continue
         word_list.append((resulting_string, probability))
 
     #all_letters_filtered_list = [word for word in word_list if all_letters_not_included(word=word, string_list = lipogram_naughty_word_list)]
@@ -246,6 +252,18 @@ def get_next_word_without_e(sequence):
                 return_word = False
         if len(ends_with_string) > 0:
             if not ends_with(word=word, ending_string = ends_with_string):
+                return_word = False
+        if constrained_length > 0:
+            if not equal_to_length(word=word, word_length=constrained_length):
+                return_word = False
+        if constrained_gt_length > 0:
+            if not greater_than_length(word=word, word_length=constrained_gt_length):
+                return_word = False
+        if constrained_lt_length > 0:
+            if not less_than_length(word=word, word_length=constrained_lt_length):
+                return_word = False
+        if palindrome_enabled == True:
+            if not palindrome(word=word):
                 return_word = False
         if return_word == True:
             all_letters_filtered_list.append(word)
@@ -411,7 +429,75 @@ def load_string_ends_with_callback():
         dpg.set_value(item = "string_ends_with_filter", value = "Ending String Filter: " + ends_with_string)
     edit_string_callback()
 
+def string_length_constrained_callback(sender, app_data, user_data):
+    if app_data == True:
+        dpg.show_item("Length Constrained Options")
+    else:
+        dpg.hide_item("Length Constrained Options")
 
+def load_string_length_constrained_callback():
+    global constrained_length
+    constrained_length = dpg.get_value("length_constrained_number")
+    constrained_length_str = str(constrained_length)
+    if not dpg.get_value("string_length_constrained_applied"):
+        dpg.add_text(tag = "string_length_constrained_applied", default_value= "String Length Constraint Applied!", parent = "Length Constrained Options")
+        dpg.add_text(tag = "string_length_constrained_filter" , default_value = "String Length Constraint Applied!  " + constrained_length_str, parent = "main_window", before = "lipogram")
+    else:
+        dpg.set_value(item = "string_length_constrained_filter", value = "String Length Constraint Filter: " + constrained_length_str)
+    edit_string_callback()
+
+def string_length_gt_constrained_callback(sender, app_data, user_data):
+    if app_data == True:
+        dpg.show_item("Length Greater Than Options")
+    else:
+        dpg.hide_item("Length Greater Than Options")
+
+def load_string_length_gt_constrained_callback():
+    global constrained_gt_length
+    constrained_gt_length = dpg.get_value("length_gt_constrained_number")
+    constrained_gt_length_str = str(constrained_gt_length)
+    if not dpg.get_value("string_length_gt_constrained_applied"):
+        dpg.add_text(tag = "string_length_gt_constrained_applied", default_value= "String Length Greater Than Constraint Applied!", parent = "Length Greater Than Options")
+        dpg.add_text(tag = "string_length_gt_constrained_filter" , default_value = "String Length Greater Than Constraint Applied!  " + constrained_gt_length_str, parent = "main_window", before = "lipogram")
+    else:
+        dpg.set_value(item = "string_length_gt_constrained_filter", value = "String Length Greater Than Constraint Filter: " + constrained_gt_length_str)
+    edit_string_callback()
+
+
+def string_length_lt_constrained_callback(sender, app_data, user_data):
+    if app_data == True:
+        dpg.show_item("Length Lesser Than Options")
+    else:
+        dpg.hide_item("Length Lesser Than Options")
+
+def load_string_length_lt_constrained_callback():
+    global constrained_lt_length
+    constrained_lt_length = dpg.get_value("length_lt_constrained_number")
+    constrained_lt_length_str = str(constrained_lt_length)
+    if not dpg.get_value("string_length_lt_constrained_applied"):
+        dpg.add_text(tag = "string_length_lt_constrained_applied", default_value= "String Length Lesser Than Constraint Applied!", parent = "Length Lesser Than Options")
+        dpg.add_text(tag = "string_length_lt_constrained_filter" , default_value = "String Length Lesser Than Constraint Applied!  " + constrained_lt_length_str, parent = "main_window", before = "lipogram")
+    else:
+        dpg.set_value(item = "string_length_lt_constrained_filter", value = "String Length Lesser Than Constraint Filter: " + constrained_lt_length_str)
+    edit_string_callback()
+
+def palindrome_callback(sender, app_data, user_data):
+    global palindrome_enabled
+    if app_data == True:
+        dpg.show_item("Palindrome Options")
+        palindrome_enabled = True
+    else:
+        dpg.hide_item("Palindrome Options")
+        palindrome_enabled = False
+
+def load_palindrome_callback():
+    global palindrome_enabled
+    if not dpg.get_value("palindrome_applied"):
+        dpg.add_text(tag = "palindrome_applied", default_value= "String Palindromeic Constraint Applied!", parent = "Palindrome Options")
+        dpg.add_text(tag = "palindrome_filter" , default_value = "String Palindromeic Constraint Applied!  ",  parent = "main_window", before = "lipogram")
+    else:
+        dpg.set_value(item = "palindrome_filter", value = "String Palindromeic Constraint Applied! ")
+    edit_string_callback()
 
 dpg.create_context()
 dpg.create_viewport()
@@ -489,29 +575,36 @@ with dpg.window(tag = "main_window", label="CTGS - Contrained Text Generation St
         dpg.add_input_text(tag = "string_end_word", width = 500, height = 500, label = "String for word to end with")
         dpg.add_button(tag="string_end_button", label="Load Ending String", callback=load_string_ends_with_callback)
 
-    dpg.add_checkbox(tag="length_constrained", label = "String Length Equal To")
+    dpg.add_checkbox(tag="length_constrained", label = "String Length Equal To", callback = string_length_constrained_callback)
 
     with dpg.child_window(tag="Length Constrained Options", show = False, height = 100, width = 600) as length_constrained_selection_window:
         dpg.add_text("Specify the length that you want your strings to be constrained to")
         dpg.add_input_int(tag = "length_constrained_number", label = "Number to constrain the length with")
-        dpg.add_button(tag="length_constrained_button", label="Load Length Constrained String", callback=load_naughty_strings_callback)
+        dpg.add_button(tag="length_constrained_button", label="Load Length Constrained String", callback=load_string_length_constrained_callback)
 
-    dpg.add_checkbox(tag="length_gt", label = "String Length Greater Than")
+    dpg.add_checkbox(tag="length_gt", label = "String Length Greater Than", callback = string_length_gt_constrained_callback)
 
     with dpg.child_window(tag="Length Greater Than Options", show = False, height = 100, width = 600) as length_gt_selection_window:
         dpg.add_text("Specify the length that you want your strings to be greater than")
         dpg.add_input_int(tag = "length_gt_constrained_number", label = "Number to constrain the length to be greater than")
-        dpg.add_button(tag="length_gt_constrained_button", label="Load Length Constrained String", callback=load_naughty_strings_callback)
+        dpg.add_button(tag="length_gt_constrained_button", label="Load Length Constrained String", callback=load_string_length_gt_constrained_callback)
 
 
-    dpg.add_checkbox(tag="length_lt", label = "String Length Lesser Than")
+    dpg.add_checkbox(tag="length_lt", label = "String Length Lesser Than", callback = string_length_lt_constrained_callback)
 
     with dpg.child_window(tag="Length Lesser Than Options", show = False, height = 100, width = 600) as length_lt_selection_window:
         dpg.add_text("Specify the length that you want your strings to be lesser than")
         dpg.add_input_int(tag = "length_lt_constrained_number", label = "Number to constrain the length to be lesser than")
-        dpg.add_button(tag="length_lt_constrained_button", label="Load Length Constrained String", callback=load_naughty_strings_callback)
+        dpg.add_button(tag="length_lt_constrained_button", label="Load Length Constrained String", callback=load_string_length_lt_constrained_callback)
 
-    dpg.add_checkbox(tag="palindrome_button", label = "Palindrome")
+    dpg.add_checkbox(tag="palindrome_button", label = "Palindrome", callback = palindrome_callback)
+
+    with dpg.child_window(tag="Palindrome Options", show = False, height = 100, width = 600) as palindrome_selection_window:
+        dpg.add_text("Press the button to force all generated strings to be palindromes!")
+        dpg.add_button(tag="palindrome_button_enabled", label="Load Palindromic String", callback=load_palindrome_callback)
+
+
+
     dpg.add_checkbox(tag="anagram_button", label = "Anagram")
     dpg.add_checkbox(tag="partial_anagram_button", label = "Partial Anagram")
     dpg.add_checkbox(tag="isogram_button", label = "Isogram")
