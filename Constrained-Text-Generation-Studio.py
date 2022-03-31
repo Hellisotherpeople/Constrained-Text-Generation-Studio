@@ -133,6 +133,7 @@ Ideas
 
 1. Longest repeating and non overlapping substring in a string
 2. List of strings to consume from, like a pangram but you specify the alphabet
+3. Edit Distance of strings, user supplies string and max distance and it returns strings with that distance. I think this is fast enough to calculate for this to work!
 
 Leetcode stuff like this
 
@@ -168,6 +169,9 @@ reverse_lipogram_nice_word_list = []
 weak_reverse_lipogram_nice_word_list = []
 string_in_positon_list = []
 string_in_positon_index_list = []
+starts_with_string = ""
+ends_with_string = ""
+
 
 """
         if alpha_numaric_transform:
@@ -236,6 +240,12 @@ def get_next_word_without_e(sequence):
                 return_word = False
         if len(string_in_positon_list) > 0:
             if not string_in_position(word=word, a_string_list=string_in_positon_list, position_index_list=string_in_positon_index_list):
+                return_word = False
+        if len(starts_with_string) > 0:
+            if not starts_with(word=word, starting_string = starts_with_string):
+                return_word = False
+        if len(ends_with_string) > 0:
+            if not ends_with(word=word, ending_string = ends_with_string):
                 return_word = False
         if return_word == True:
             all_letters_filtered_list.append(word)
@@ -368,6 +378,41 @@ def load_string_positon_callback():
     edit_string_callback()
 
 
+
+def string_starts_with_callback(sender, app_data, user_data):
+    if app_data == True:
+        dpg.show_item("Starting String Options")
+    else:
+        dpg.hide_item("Starting String Options")
+
+def load_string_starts_with_callback():
+    global starts_with_string
+    starts_with_string = dpg.get_value("string_start_word")
+    if not dpg.get_value("string_starts_with_applied"):
+        dpg.add_text(tag = "string_starts_with_applied", default_value= "Starting String Applied!", parent = "Starting String Options")
+        dpg.add_text(tag = "string_starts_with_filter" , default_value = "Starting String Applied!  " + starts_with_string, parent = "main_window", before = "lipogram")
+    else:
+        dpg.set_value(item = "string_starts_with_filter", value = "Starting String Filter: " + starts_with_string)
+    edit_string_callback()
+
+def string_ends_with_callback(sender, app_data, user_data):
+    if app_data == True:
+        dpg.show_item("Ending String Options")
+    else:
+        dpg.hide_item("Ending String Options")
+
+def load_string_ends_with_callback():
+    global ends_with_string
+    ends_with_string = dpg.get_value("string_end_word")
+    if not dpg.get_value("string_ends_with_applied"):
+        dpg.add_text(tag = "string_ends_with_applied", default_value= "Ending String Applied!", parent = "Ending String Options")
+        dpg.add_text(tag = "string_ends_with_filter" , default_value = "Ending String Applied!  " + ends_with_string, parent = "main_window", before = "lipogram")
+    else:
+        dpg.set_value(item = "string_ends_with_filter", value = "Ending String Filter: " + ends_with_string)
+    edit_string_callback()
+
+
+
 dpg.create_context()
 dpg.create_viewport()
 dpg.setup_dearpygui()
@@ -430,19 +475,19 @@ with dpg.window(tag = "main_window", label="CTGS - Contrained Text Generation St
         dpg.add_input_text(tag = "string_position_int", width = 500, height = 500, label = "List of indexes")
         dpg.add_button(tag="string_position_button", label="Load Strings", callback = load_string_positon_callback)
 
-    dpg.add_checkbox(tag="string_starts", label = "String Starts With")
+    dpg.add_checkbox(tag="string_starts", label = "String Starts With", callback = string_starts_with_callback)
 
-    with dpg.child_window(tag="Starting Starts With Options", show = False, height = 100, width = 600) as starting_string_selection_window:
+    with dpg.child_window(tag="Starting String Options", show = False, height = 100, width = 600) as starting_string_selection_window:
         dpg.add_text("Add the string that the word should start with")
         dpg.add_input_text(tag = "string_start_word", width = 500, height = 500, label = "String for word to start with")
-        dpg.add_button(tag="string_start_button", label="Load Starting String", callback=load_naughty_strings_callback)
+        dpg.add_button(tag="string_start_button", label="Load Starting String", callback=load_string_starts_with_callback)
 
-    dpg.add_checkbox(tag="string_ends", label = "String Ends With")
+    dpg.add_checkbox(tag="string_ends", label = "String Ends With", callback = string_ends_with_callback)
 
-    with dpg.child_window(tag="Starting Ends With Options", show = False, height = 100, width = 600) as ending_string_selection_window:
+    with dpg.child_window(tag="Ending String Options", show = False, height = 100, width = 600) as ending_string_selection_window:
         dpg.add_text("Add the string that the word should end with")
         dpg.add_input_text(tag = "string_end_word", width = 500, height = 500, label = "String for word to end with")
-        dpg.add_button(tag="string_end_button", label="Load Ending String", callback=load_naughty_strings_callback)
+        dpg.add_button(tag="string_end_button", label="Load Ending String", callback=load_string_ends_with_callback)
 
     dpg.add_checkbox(tag="length_constrained", label = "String Length Equal To")
 
