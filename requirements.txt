@@ -1,3 +1,7 @@
 dearpygui
 torch
 transformers
+abydos
+fasttext
+huggingface_hub
+scipy
