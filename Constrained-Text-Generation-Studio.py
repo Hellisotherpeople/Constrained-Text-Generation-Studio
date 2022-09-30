@@ -1,39 +1,31 @@
-import dearpygui.dearpygui as dpg
+import random
 import re
-from unittest import result
 import string
+import time as time
 from collections import Counter
+
+
+import dearpygui.dearpygui as dpg
+import fasttext
+import pronouncing
 import torch
+from abydos.distance import Levenshtein
+from abydos.phonetic import DoubleMetaphone
+from huggingface_hub import hf_hub_download
+from scipy import spatial
 from torch.nn import functional as F
-from transformers import (AutoModelForCausalLM, AutoModelForQuestionAnswering, 
+from transformers import (AutoModelForCausalLM, AutoModelForQuestionAnswering,
                           AutoModelForSeq2SeqLM,
                           AutoModelForSequenceClassification, AutoTokenizer,
                           GPT2Tokenizer, LogitsProcessor, LogitsProcessorList,
                           pipeline, top_k_top_p_filtering)
 
-from abydos.phonetic import DoubleMetaphone, Eudex 
-from abydos.distance import Levenshtein
-from huggingface_hub import hf_hub_download
-import fasttext
-from scipy import spatial
-import random
-import time as time
-import pronouncing
-
-
-##TODO: String Distance Matching (Abydos has SO many of these)
-##TODO: Allow more semantic, phonetic models (Maybe allow specification of fasttext weights, dropdown select some phonetic models)
-##TODO: "Pronoucning" models, syllabul counting filter, meter, rhyme - https://pronouncing.readthedocs.io/en/latest/tutorial.html#counting-syllables 
-##          ^^^ remove Abydos (it's GNU) and use exclusviely pronouncings pronciation search, syllables counting, meter, rhyme
-##          Also display all returned words in a textbox so that a user has more to play with
+##TODO: Allow more semantic, phonetic, lexical models (Maybe allow specification of fasttext weights, dropdown select some phonetic models)
 ##TODO: Loading Bars when loading model, and when generating text
 ##TODO: Allow the user to decide to regenerate new predictions with a right click?
-##TODO: Detect when a model is loaded and display a nice checkmark, and then also a nice thing if GPU is working too! 
 ##TODO: Button for loading Masked Language Models, and then displaying the tokenizer masking character, enabling the user to right click and to tab
 ##TODO: Proper layout somehow
-##TODO: Learn how to draw a horizontal bar - maybe use a 1x2 table? Use this for "loaded filters child window" 
 ##TODO: "novalty generation constraints" like pilish (specify list of word lengths) or pangram/perfect pangram generation
-##TODO: Proper code for active filters displayed
 
 starttime = time.time()
 
@@ -909,12 +901,96 @@ def turn_filters_off_callback():
     partial_anagram_string = ""
     isogram_count = 0
     reverse_isogram_count = 0
+
+    ### Yes this is bad code, no I don't care. 
     if dpg.get_value("partial_anagram_applied"):
         dpg.delete_item("partial_anagram_applied")
     if dpg.get_value("partial_anagram_filter"):
         dpg.delete_item("partial_anagram_filter")
-    dpg.set_value("partial_anagram_string", "")
-
+    if dpg.get_value("naughty_applied"):
+        dpg.delete_item("naughty_applied")
+    if dpg.get_value("naughty_filter"):
+        dpg.delete_item("naughty_filter") 
+    if dpg.get_value("weak_naughty_applied"):
+        dpg.delete_item("weak_naughty_applied")
+    if dpg.get_value("weak_naughty_filter"):
+        dpg.delete_item("weak_naughty_filter")
+    if dpg.get_value("reverse_nice_applied"):
+        dpg.delete_item("reverse_nice_applied")
+    if dpg.get_value("reverse_nice_filter"):
+        dpg.delete_item("reverse_nice_filter")        
+    if dpg.get_value("weak_reverse_nice_applied"):
+        dpg.delete_item("weak_reverse_nice_applied")
+    if dpg.get_value("weak_reverse_nice_filter"):
+        dpg.delete_item("weak_reverse_nice_filter")
+    if dpg.get_value("string_position_applied"):
+        dpg.delete_item("string_position_applied")
+    if dpg.get_value("string_position_filter"):
+        dpg.delete_item("string_position_filter")
+    if dpg.get_value("string_starts_with_applied"):
+        dpg.delete_item("string_starts_with_applied")
+    if dpg.get_value("string_starts_with_filter"):
+        dpg.delete_item("string_starts_with_filter")  
+    if dpg.get_value("string_ends_with_applied"):
+        dpg.delete_item("string_ends_with_applied")
+    if dpg.get_value("string_ends_with_filter"):
+        dpg.delete_item("string_ends_with_filter")
+    if dpg.get_value("string_length_constrained_applied"):
+        dpg.delete_item("string_length_constrained_applied")
+    if dpg.get_value("string_length_constrained_filter"):
+        dpg.delete_item("string_length_constrained_filter")  
+    if dpg.get_value("string_length_gt_constrained_applied"):
+        dpg.delete_item("string_length_gt_constrained_applied")
+    if dpg.get_value("string_length_gt_constrained_filter"):
+        dpg.delete_item("string_length_gt_constrained_filter")   
+    if dpg.get_value("string_length_lt_constrained_applied"):
+        dpg.delete_item("string_length_lt_constrained_applied")
+    if dpg.get_value("string_length_lt_constrained_filter"):
+        dpg.delete_item("string_length_lt_constrained_filter")   
+    if dpg.get_value("phonetic_applied"):
+        dpg.delete_item("phonetic_applied")
+    if dpg.get_value("phonetic_filter"):
+        dpg.delete_item("phonetic_filter")   
+    if dpg.get_value("semantic_applied"):
+        dpg.delete_item("semantic_applied")
+    if dpg.get_value("semantic_filter"):
+        dpg.delete_item("semantic_filter")   
+    if dpg.get_value("string_edit_applied"):
+        dpg.delete_item("string_edit_applied")
+    if dpg.get_value("string_edit_filter"):
+        dpg.delete_item("string_edit_filter")
+    if dpg.get_value("syllable_applied"):
+        dpg.delete_item("syllable_applied")
+    if dpg.get_value("syllable_filter"):
+        dpg.delete_item("syllable_filter")
+    if dpg.get_value("meter_applied"):
+        dpg.delete_item("meter_applied")
+    if dpg.get_value("meter_filter"):
+        dpg.delete_item("meter_filter")
+    if dpg.get_value("rhyme_applied"):
+        dpg.delete_item("rhyme_applied")
+    if dpg.get_value("rhyme_filter"):
+        dpg.delete_item("rhyme_filter")
+    if dpg.get_value("palindrome_applied"):
+        dpg.delete_item("palindrome_applied")
+    if dpg.get_value("palindrome_filter"):
+        dpg.delete_item("palindrome_filter")
+    if dpg.get_value("anagram_applied"):
+        dpg.delete_item("anagram_applied")
+    if dpg.get_value("anagram_filter"):
+        dpg.delete_item("anagram_filter")                                                                                         
+    if dpg.get_value("partial_anagram_applied"):
+        dpg.delete_item("partial_anagram_applied")
+    if dpg.get_value("partial_anagram_filter"):
+        dpg.delete_item("partial_anagram_filter")
+    if dpg.get_value("isogram_applied"):
+        dpg.delete_item("isogram_applied")
+    if dpg.get_value("isogram_filter"):
+        dpg.delete_item("isogram_filter")   
+    if dpg.get_value("reverse_isogram_applied"):
+        dpg.delete_item("reverse_isogram_applied")
+    if dpg.get_value("reverse_isogram_filter"):
+        dpg.delete_item("reverse_isogram_filter")                                     
     edit_string_callback()
     #TODO: Finish this
 
@@ -953,7 +1029,8 @@ def edited_call(sender, app_data, user_data):
 
 
 with dpg.window(tag = "main_window", label="CTGS - Contrained Text Generation Studio", no_close = True, width = 1000) as window:
-    dpg.add_text("Main Settings")
+    dpg.add_text("Main Text Box")
+    dpg.add_text("Right Click within the text box for LM recommended continuations with constraints applied!")
     dpg.add_input_text(tag = "input_string", width = 900, height = 500, multiline=True, default_value = "Type something here!")
 
     with dpg.window(tag = "load_model_window", label = "Model Settings", pos = (1100, 200), no_close = True) as model_window:
@@ -1146,6 +1223,7 @@ with dpg.window(tag = "main_window", label="CTGS - Contrained Text Generation St
     dpg.add_input_float(tag = "temperature", label = "Temperature", default_value = 1.0)
     _help("lowering the so-called temperature increases the likelihood of high probability words and decreasing the likelihood of low probability words. Increasing does the opposite.")
     dpg.add_input_int(tag = "num_tokens_to_generate", label = "Number of tokens to generate", default_value = 20)
+    _help("This only impacts how many tokens are generated by the AI generate some tokens button")
     dpg.add_checkbox(tag="greedy_decoding", label = "Enable greedy decoding?")
     _help("This will override top-p and top-k sampling and only select the most likely token everytime")
     
@@ -1178,6 +1256,19 @@ with dpg.window(tag = "main_window", label="CTGS - Contrained Text Generation St
         dpg.add_checkbox(tag = "filter_blank_outputs", label = "Filter blank outputs")
         _help("After applying some other transforms, there may be leftover blanks. This will remove them")
 
+    with dpg.window(tag="Readme", show = True, label = "Read Me First", pos = (500, 500), no_close = False) as read_me_options:
+        dpg.add_text(default_value ="Usage tips:")
+        dpg.add_text(default_value="The first time you run this, it may take a few minutes to be ready to run because distilgpt2 and fasttext are being downloaded from huggingface. Wait until you see a messege in the Model Settings window about it being succesfully loaded before trying to run CTGS.", bullet = True)
+        dpg.add_text(default_value ="Right click anywhere within the text box for a list of continuations with the enabled filters to appear", bullet = True)
+        dpg.add_text(default_value ="The F1 key generates new tokens given the context (populates the right click continuations box), and is equivilant to the Predict New Tokens button", bullet = True)
+        dpg.add_text(default_value ="The F2 key directly inserts the next token into the text box using the models decoder (and top_p, top_k, temperature) settings. It's equivilant to the AI generate some tokens button", bullet = True)
+        dpg.add_text(default_value="If you're not seeing continuations using F2 or the ai generate some token button, make sure that it's not generating spaces, line returns, or other blank characters", bullet = True)
+        dpg.add_text(default_value="Use the text transforms list to apply transforms to the vocabulary before the constraints are applied. To mitigate the problem of the LM generating spaces, you could for example use the filter blank outputs transform", bullet = True)
+        dpg.add_text(default_value="After typing or copying/pasting text into the text box, use the Predict New Tokens button or F1 to get new continuations (what you see when you right click) given your context.", bullet = True)
+        dpg.add_text(default_value="After publication, I intend to open source this. In the next release, I will add support for BERT/Masked Language Models. I've already tested and know they work using this technique in principle.")
+        dpg.add_text(default_value = "This utility is written using the DearPyGUI GUI library, and has the tiling mode enabled. You can move around the windows and tile them with each other to your hearts desire. I think a tool like this is a natural fit for a tiling window manager style layout")
+        dpg.add_text(default_value = "Hovering over a green question-mark will pop-up a tooltip to give you context/help")
+        dpg.add_text(default_value = "This window can be closed with the X in the top right")
 
 
 with dpg.handler_registry():
