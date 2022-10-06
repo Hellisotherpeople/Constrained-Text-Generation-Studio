@@ -25,8 +25,9 @@ CTGS, along with the related contributions of its [datasets](https://huggingface
 
 # Install Instructions
 
-1. Clone the repo 
-2. `pip install -r requirements.txt`
-3. `python3 Constrained-Text-Generation-Studio.py`
+1.  Clone the repo
+2.  cd into the repo directory (you may get font errors if you don't cd into it) 
+3. `pip install -r requirements.txt`
+4. `python3 Constrained-Text-Generation-Studio.py`
 
 # Screenshots
