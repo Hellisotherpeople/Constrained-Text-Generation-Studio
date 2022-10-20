@@ -2,6 +2,9 @@
 # Constrained-Text-Generation-Studio
 ### _"It's Like Photoshop but for Creative Writing!"_
 
+ 	
+[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/most-language-models-can-be-poets-too-an-ai/conditional-text-generation-on-lipogram-e)](https://paperswithcode.com/sota/conditional-text-generation-on-lipogram-e?p=most-language-models-can-be-poets-too-an-ai)
+
 ![](pictures/CTGS_main_screen.JPG)
 
 # Table of Contents  
