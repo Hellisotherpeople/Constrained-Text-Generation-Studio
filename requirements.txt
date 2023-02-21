@@ -5,3 +5,4 @@ abydos
 fasttext
 huggingface_hub
 scipy
+pronouncing
