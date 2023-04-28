@@ -3,14 +3,12 @@ import re
 import string
 import time as time
 from collections import Counter
-
+import numpy as np
 
 import dearpygui.dearpygui as dpg
 import fasttext
 import pronouncing
 import torch
-from abydos.distance import Levenshtein
-from abydos.phonetic import DoubleMetaphone
 from huggingface_hub import hf_hub_download
 from scipy import spatial
 from torch.nn import functional as F
@@ -34,8 +32,6 @@ fasttext_model = fasttext.load_model(hf_hub_download("osanseviero/fasttext_embed
 
 tokenizer = ""
 model = ""
-pe = DoubleMetaphone()
-cmp = Levenshtein()
 
 def add_and_load_image(image_path, parent=None):
     width, height, channels, data = dpg.load_image(image_path)
@@ -65,7 +61,10 @@ def load_model(the_name):
     else:
         model_name = the_name
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name)
+    if dpg.get_value("8bit"):
+        model = AutoModelForCausalLM.from_pretrained(model_name, device_map='auto', load_in_8bit=True)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(model_name, device_map='auto', load_in_8bit=False)
     if torch.cuda.is_available():
         loaded_model_string = model_name + " Loaded Succesfully onto the GPU"
         dpg.add_text(parent = "load_model_window", default_value = loaded_model_string)
@@ -78,62 +77,35 @@ def load_model(the_name):
 ########--------------------------------------------------------------#### Filters ########--------------------------------------------------------------####
 
 def all_letters_included(word, string_list):
-    #any(c in letters for c in word)
-    if all(c in word[0] for c in string_list):
-        return True
-    else:
-        return False
+    return all(c in word[0] for c in string_list)
+
 
 def any_letters_included(word, string_list):
-    #any(c in letters for c in word)
-    if any(c in string_list for c in word[0]):
-        return True
-    else:
-        return False
+    return any(c in string_list for c in word[0])
 
 def all_letters_not_included(word, string_list):
     #any(c in letters for c in word)
-    if all(c not in word[0] for c in string_list):
-        return True
-    else:
-        return False
+    return all(c not in word[0] for c in string_list)
 
 def any_letters_not_included(word, string_list):
     ## "e.g. not words with both B and T in them!"
-    if any(c not in string_list for c in word[0]):
-        return True
-    else:
-        return False
+    return any(c not in string_list for c in word[0])
 
 def equal_to_length(word, word_length):
-    if len(word[0]) == word_length:
-        return True
-    else:
-        return False
+    return len(word[0]) == word_length
+
 
 def greater_than_length(word, word_length):
-    if len(word[0]) > word_length:
-        return True
-    else:
-        return False
+    return len(word[0]) > word_length
 
 def less_than_length(word, word_length):
-    if len(word[0]) < word_length:
-        return True
-    else:
-        return False
+    return len(word[0]) < word_length
 
 def ends_with(word, ending_string,  start = None, end = None):
-    if word[0].endswith(ending_string, start, end):
-        return True
-    else:
-        return False
+    return word[0].endswith(ending_string, start, end)
 
 def starts_with(word, starting_string, start = None, end = None):
-    if word[0].startswith(starting_string, start, end):
-        return True
-    else:
-        return False
+    return word[0].startswith(starting_string, start, end)
 
 def string_in_position(word, a_string_list, position_index_list):
     for idx, string in enumerate(a_string_list):
@@ -292,141 +264,103 @@ reverse_isogram_count = 0
 def get_next_word_without_e(sequence):
     all_letters_filtered_list = []
     #print(tokenizer)
-    input_ids = tokenizer.encode(sequence, return_tensors="pt")
-    # get logits of last hidden state
-    next_token_candidates_logits = model(input_ids)[0][:, -1, :]
-    temperature = dpg.get_value("temperature")
-    if temperature != 1.0:
-        next_token_candidates_logits = next_token_candidates_logits / temperature
-    # filter
-    top_p = dpg.get_value("top_p")
-    top_k = dpg.get_value("top_k")
-    if (top_p > 0 and top_k > 0):
-        filtered_next_token_candidates_logits = top_k_top_p_filtering(next_token_candidates_logits, top_k=top_k, top_p=top_p)
-    elif top_p > 0:
-        filtered_next_token_candidates_logits = top_k_top_p_filtering(next_token_candidates_logits, top_p=top_p)
-    elif top_k > 0:
-        filtered_next_token_candidates_logits = top_k_top_p_filtering(next_token_candidates_logits, top_k=top_k)
-    else:
-        filtered_next_token_candidates_logits = next_token_candidates_logits
-    # sample and get a probability distribution
-    probs = F.softmax(filtered_next_token_candidates_logits, dim=-1).sort(descending = True)
-    #next_token_candidates = torch.multinomial(probs, num_samples=number_of_tokens_to_sample) ## 10000 random samples
-    #print(next_token_candidates)
-    word_list = []
-    #print(probs[0][0][0].item())
-        #print(probs[1])## the indicies, probs[0] is the probabilities
-    for iter, candidate in enumerate(probs[1][0]):
-        probability = probs[0][0][iter].item()
-        resulting_string = tokenizer.decode(candidate) #skip_special_tokens=True, clean_up_tokenization_spaces=True)
-        ##TODO: Consider implementing transforms inspired by stuff in the itertools/moreitertools libraries
-        if dpg.get_value("upper_case_transform"):
-            resulting_string = resulting_string.upper()
-        if dpg.get_value("lower_case_transform"):
-            resulting_string = resulting_string.lower()
-        if dpg.get_value("replace_spaces"):
-            resulting_string = resulting_string.replace(' ', '')
-        if dpg.get_value("lstrip_transform"):
-            resulting_string = resulting_string.lstrip()
-        if dpg.get_value("rstrip_transform"):
-            resulting_string = resulting_string.rstrip()
-        if dpg.get_value("strip_transform"):
-            resulting_string = resulting_string.strip()
-        if dpg.get_value("capitalize_first_letter_transform"):
-            resulting_string = resulting_string.capitalize()
-        if dpg.get_value("alpha_numaric_transform"):
-            resulting_string = ''.join(ch for ch in resulting_string if ch.isalnum())
-        if dpg.get_value("alpha_transform"):
-            resulting_string = ''.join(ch for ch in resulting_string if ch.isalpha())
-        if dpg.get_value("digit_transform"):
-            resulting_string = ''.join(ch for ch in resulting_string if ch.isdigit())
-        if dpg.get_value("ascii_transform"):
-            resulting_string = ''.join(ch for ch in resulting_string if ch.isascii())
-        if dpg.get_value("filter_blank_outputs"):
-            if resulting_string == "":
-                continue
-        word_list.append((resulting_string, probability))
+    with torch.no_grad():
+        input_ids = tokenizer.encode(sequence, return_tensors="pt")
+        # get logits of last hidden state
+        next_token_candidates_logits = model(input_ids)[0][:, -1, :]
+        temperature = dpg.get_value("temperature")
+        if temperature != 1.0:
+            next_token_candidates_logits = next_token_candidates_logits / temperature
+        # filter
+        top_p = dpg.get_value("top_p")
+        top_k = dpg.get_value("top_k")
+        if (top_p > 0 and top_k > 0):
+            filtered_next_token_candidates_logits = top_k_top_p_filtering(next_token_candidates_logits, top_k=top_k, top_p=top_p)
+        elif top_p > 0:
+            filtered_next_token_candidates_logits = top_k_top_p_filtering(next_token_candidates_logits, top_p=top_p)
+        elif top_k > 0:
+            filtered_next_token_candidates_logits = top_k_top_p_filtering(next_token_candidates_logits, top_k=top_k)
+        else:
+            filtered_next_token_candidates_logits = next_token_candidates_logits
+        # sample and get a probability distribution
+        probs = F.softmax(filtered_next_token_candidates_logits.float(), dim=-1).sort(descending = True)
+        #next_token_candidates = torch.multinomial(probs, num_samples=number_of_tokens_to_sample) ## 10000 random samples
+        #print(next_token_candidates)
+        word_list = []
+        #token_representation = tokenizer.convert_ids_to_tokens(probs[1][0])
+        #print(token_representation[0:5])
+        resulting_strings = tokenizer.batch_decode(probs[1][0])
+        #print(probs[0][0][0].item())
+            #print(probs[1])## the indicies, probs[0] is the probabilities
+        for iter, resulting_string in enumerate(resulting_strings):
+            probability = probs[0][0][iter].item()
+            ##TODO: Consider implementing transforms inspired by stuff in the itertools/moreitertools libraries
+            if dpg.get_value("upper_case_transform"):
+                resulting_string = resulting_string.upper()
+            if dpg.get_value("lower_case_transform"):
+                resulting_string = resulting_string.lower()
+            if dpg.get_value("replace_spaces"):
+                resulting_string = resulting_string.replace(' ', '')
+            if dpg.get_value("lstrip_transform"):
+                resulting_string = resulting_string.lstrip()
+            if dpg.get_value("rstrip_transform"):
+                resulting_string = resulting_string.rstrip()
+            if dpg.get_value("strip_transform"):
+                resulting_string = resulting_string.strip()
+            if dpg.get_value("capitalize_first_letter_transform"):
+                resulting_string = resulting_string.capitalize()
+            if dpg.get_value("alpha_numaric_transform"):
+                resulting_string = ''.join(ch for ch in resulting_string if ch.isalnum())
+            if dpg.get_value("alpha_transform"):
+                resulting_string = ''.join(ch for ch in resulting_string if ch.isalpha())
+            if dpg.get_value("digit_transform"):
+                resulting_string = ''.join(ch for ch in resulting_string if ch.isdigit())
+            if dpg.get_value("ascii_transform"):
+                resulting_string = ''.join(ch for ch in resulting_string if ch.isascii())
+            if dpg.get_value("filter_blank_outputs"):
+                if resulting_string == "":
+                    continue
+            word_list.append((resulting_string, probability))
 
-    #all_letters_filtered_list = [word for word in word_list if all_letters_not_included(word=word, string_list = lipogram_naughty_word_list)]
+        #all_letters_filtered_list = [word for word in word_list if all_letters_not_included(word=word, string_list = lipogram_naughty_word_list)]
 
-    for word in word_list:
-        return_word = True
-        if len(lipogram_naughty_word_list) > 0:
-            if not all_letters_not_included(word=word, string_list = lipogram_naughty_word_list):
-                return_word = False
-        if len(weak_lipogram_naughty_word_list) > 0:
-            if not any_letters_not_included(word=word, string_list = weak_lipogram_naughty_word_list):
-                return_word = False
-        if len(reverse_lipogram_nice_word_list) > 0:
-            if not all_letters_included(word=word, string_list = reverse_lipogram_nice_word_list):
-                return_word = False 
-        if len(weak_reverse_lipogram_nice_word_list) > 0:
-            if not any_letters_included(word=word, string_list = weak_reverse_lipogram_nice_word_list):
-                return_word = False
-        if len(string_in_positon_list) > 0:
-            if not string_in_position(word=word, a_string_list=string_in_positon_list, position_index_list=string_in_positon_index_list):
-                return_word = False
-        if len(starts_with_string) > 0:
-            if not starts_with(word=word, starting_string = starts_with_string):
-                return_word = False
-        if len(ends_with_string) > 0:
-            if not ends_with(word=word, ending_string = ends_with_string):
-                return_word = False
-        if constrained_length > 0:
-            if not equal_to_length(word=word, word_length=constrained_length):
-                return_word = False
-        if constrained_gt_length > 0:
-            if not greater_than_length(word=word, word_length=constrained_gt_length):
-                return_word = False
-        if constrained_lt_length > 0:
-            if not less_than_length(word=word, word_length=constrained_lt_length):
-                return_word = False
-        if palindrome_enabled == True:
-            if not palindrome(word=word):
-                return_word = False
-        if len(phonetic_matching_string) > 0:
-            if not phonetic_matching(word=word, phonetic_matching_string=phonetic_matching_string):
-                return_word = False
-        if len(semantic_matching_string) > 0:
-            if not semantic_matching(word=word, semantic_string = semantic_matching_string, semantic_threshold = semantic_distance_threshold):
-                return_word = False
-        if len(anagram_string) > 0:
-            if not full_anagram(word=word, a_string = anagram_string):
-                return_word = False
-        if len(partial_anagram_string) > 0:
-            if not partial_anagram(word=word, a_string = partial_anagram_string):
-                return_word = False
-        if len(rhyme_string) > 0:
-            if not rhyme(word=word, rhyme_string= rhyme_string):
-                return_word = False
-        if len(meter_string) > 0:
-            if not meter(word=word, meter_string = meter_string):
-                return_word = False
-        if len(string_edit_string) > 0:
-            if not string_edit(word=word, string_edit_string=string_edit_string, string_edit_threshold=string_edit_distnace_threhold):
-                return_word = False
-        if syllable_number > 0:
-            if not syllable(word=word, syllable_number=syllable_number):
-                return_word = False
-        if isogram_count >= 1:
-            if not isogram(word = word, count = isogram_count):
-                return_word = False
-        if reverse_isogram_count >= 1:
-            if not reverse_isogram(word = word, count = reverse_isogram_count):
-                return_word = False
-        if return_word == True:
-            all_letters_filtered_list.append(word)
-        
+        all_letters_filtered_list = [
+        word for word in word_list
+        if (
+            (not lipogram_naughty_word_list or all_letters_not_included(word=word, string_list=lipogram_naughty_word_list)) and
+            (not weak_lipogram_naughty_word_list or any_letters_not_included(word=word, string_list=weak_lipogram_naughty_word_list)) and
+            (not reverse_lipogram_nice_word_list or all_letters_included(word=word, string_list=reverse_lipogram_nice_word_list)) and
+            (not weak_reverse_lipogram_nice_word_list or any_letters_included(word=word, string_list=weak_reverse_lipogram_nice_word_list)) and
+            (not string_in_positon_list or string_in_position(word=word, a_string_list=string_in_positon_list, position_index_list=string_in_positon_index_list)) and
+            (not starts_with_string or starts_with(word=word, starting_string=starts_with_string)) and
+            (not ends_with_string or ends_with(word=word, ending_string=ends_with_string)) and
+            (not constrained_length or equal_to_length(word=word, word_length=constrained_length)) and
+            (not constrained_gt_length or greater_than_length(word=word, word_length=constrained_gt_length)) and
+            (not constrained_lt_length or less_than_length(word=word, word_length=constrained_lt_length)) and
+            (not palindrome_enabled or palindrome(word=word)) and
+            (not phonetic_matching_string or phonetic_matching(word=word, phonetic_matching_string=phonetic_matching_string)) and
+            (not semantic_matching_string or semantic_matching(word=word, semantic_string=semantic_matching_string, semantic_threshold=semantic_distance_threshold)) and
+            (not anagram_string or full_anagram(word=word, a_string=anagram_string)) and
+            (not partial_anagram_string or partial_anagram(word=word, a_string=partial_anagram_string)) and
+            (not rhyme_string or rhyme(word=word, rhyme_string=rhyme_string)) and
+            (not meter_string or meter(word=word, meter_string=meter_string)) and
+            (not string_edit_string or string_edit(word=word, string_edit_string=string_edit_string, string_edit_threshold=string_edit_distnace_threhold)) and
+            (not syllable_number or syllable(word=word, syllable_number=syllable_number)) and
+            (isogram_count < 1 or isogram(word=word, count=isogram_count)) and
+            (reverse_isogram_count < 1 or reverse_isogram(word=word, count=reverse_isogram_count))
+        )
+    ]
+            
 
-    #all_letters_filtered_list = [word for word in word_list if all_letters_not_included(word=word, starting_string= "EN")]
-    #list(filter(all_letters_included, word_list))
-    #print(probs)
-    #print(all_letters_filtered_list[0:50])
-    #print(probs)
+        #all_letters_filtered_list = [word for word in word_list if all_letters_not_included(word=word, starting_string= "EN")]
+        #list(filter(all_letters_included, word_list))
+        #print(probs)
+        #print(all_letters_filtered_list[0:50])
+        #print(probs)
 
 
-                
-    return all_letters_filtered_list
+                    
+        return all_letters_filtered_list
 
 
 def tab_key_generate_tokens_callback():
@@ -442,24 +376,26 @@ def tab_key_generate_tokens_callback():
 
 def generate_tokens_callback():
     number_of_tokens = dpg.get_value("num_tokens_to_generate")
-    i = 0
-    while i <= number_of_tokens:
-        string_input = dpg.get_value("input_string")
+    greedy_decoding = dpg.get_value("greedy_decoding")
+    string_input = dpg.get_value("input_string")
+
+    for _ in range(number_of_tokens):
         generated_output = get_next_word_without_e(string_input)
-        if dpg.get_value("greedy_decoding"):
+
+        if greedy_decoding:
             returned_word = generated_output[0][0]
         else:
-            probability_weights = list(zip(*generated_output))[1]
-            returned_word = random.choices(generated_output, weights = probability_weights, k = 1)[0][0]  
-        #print(returned_word)
-        new_string = string_input + returned_word
-        new_value = dpg.set_value("input_string", new_string)
-        i = i+1
+            words, probabilities = zip(*generated_output)
+            probabilities_normalized = np.array(probabilities) / np.sum(probabilities)
+            returned_word = np.random.choice(words, p=probabilities_normalized)
+
+        string_input += returned_word
+        dpg.set_value("input_string", string_input)
 
 def add_generated_word_callback(sender, app_data, user_data):
     current_value = dpg.get_value("input_string")
     new_string = current_value + str(user_data)
-    new_value = dpg.set_value("input_string", new_string)
+    dpg.set_value("input_string", new_string)
     edit_string_callback()
 
 def edit_string_callback():
@@ -480,9 +416,6 @@ def edit_string_callback():
 
 def typed_calledback(sender, app_data, user_data):
     dpg.set_value("pretty_input_string", str(app_data))
-
-
-
 
 def lipogram_callback(sender, app_data, user_data):
     if app_data == True:
@@ -901,96 +834,34 @@ def turn_filters_off_callback():
     partial_anagram_string = ""
     isogram_count = 0
     reverse_isogram_count = 0
+ 
+    filters = [
+    "partial_anagram_applied", "partial_anagram_filter",
+    "naughty_applied", "naughty_filter",
+    "weak_naughty_applied", "weak_naughty_filter",
+    "reverse_nice_applied", "reverse_nice_filter",
+    "weak_reverse_nice_applied", "weak_reverse_nice_filter",
+    "string_position_applied", "string_position_filter",
+    "string_starts_with_applied", "string_starts_with_filter",
+    "string_ends_with_applied", "string_ends_with_filter",
+    "string_length_constrained_applied", "string_length_constrained_filter",
+    "string_length_gt_constrained_applied", "string_length_gt_constrained_filter",
+    "string_length_lt_constrained_applied", "string_length_lt_constrained_filter",
+    "phonetic_applied", "phonetic_filter",
+    "semantic_applied", "semantic_filter",
+    "string_edit_applied", "string_edit_filter",
+    "syllable_applied", "syllable_filter",
+    "meter_applied", "meter_filter",
+    "rhyme_applied", "rhyme_filter",
+    "palindrome_applied", "palindrome_filter",
+    "anagram_applied", "anagram_filter",
+    "isogram_applied", "isogram_filter",
+    "reverse_isogram_applied", "reverse_isogram_filter"]
 
-    ### Yes this is bad code, no I don't care. 
-    if dpg.get_value("partial_anagram_applied"):
-        dpg.delete_item("partial_anagram_applied")
-    if dpg.get_value("partial_anagram_filter"):
-        dpg.delete_item("partial_anagram_filter")
-    if dpg.get_value("naughty_applied"):
-        dpg.delete_item("naughty_applied")
-    if dpg.get_value("naughty_filter"):
-        dpg.delete_item("naughty_filter") 
-    if dpg.get_value("weak_naughty_applied"):
-        dpg.delete_item("weak_naughty_applied")
-    if dpg.get_value("weak_naughty_filter"):
-        dpg.delete_item("weak_naughty_filter")
-    if dpg.get_value("reverse_nice_applied"):
-        dpg.delete_item("reverse_nice_applied")
-    if dpg.get_value("reverse_nice_filter"):
-        dpg.delete_item("reverse_nice_filter")        
-    if dpg.get_value("weak_reverse_nice_applied"):
-        dpg.delete_item("weak_reverse_nice_applied")
-    if dpg.get_value("weak_reverse_nice_filter"):
-        dpg.delete_item("weak_reverse_nice_filter")
-    if dpg.get_value("string_position_applied"):
-        dpg.delete_item("string_position_applied")
-    if dpg.get_value("string_position_filter"):
-        dpg.delete_item("string_position_filter")
-    if dpg.get_value("string_starts_with_applied"):
-        dpg.delete_item("string_starts_with_applied")
-    if dpg.get_value("string_starts_with_filter"):
-        dpg.delete_item("string_starts_with_filter")  
-    if dpg.get_value("string_ends_with_applied"):
-        dpg.delete_item("string_ends_with_applied")
-    if dpg.get_value("string_ends_with_filter"):
-        dpg.delete_item("string_ends_with_filter")
-    if dpg.get_value("string_length_constrained_applied"):
-        dpg.delete_item("string_length_constrained_applied")
-    if dpg.get_value("string_length_constrained_filter"):
-        dpg.delete_item("string_length_constrained_filter")  
-    if dpg.get_value("string_length_gt_constrained_applied"):
-        dpg.delete_item("string_length_gt_constrained_applied")
-    if dpg.get_value("string_length_gt_constrained_filter"):
-        dpg.delete_item("string_length_gt_constrained_filter")   
-    if dpg.get_value("string_length_lt_constrained_applied"):
-        dpg.delete_item("string_length_lt_constrained_applied")
-    if dpg.get_value("string_length_lt_constrained_filter"):
-        dpg.delete_item("string_length_lt_constrained_filter")   
-    if dpg.get_value("phonetic_applied"):
-        dpg.delete_item("phonetic_applied")
-    if dpg.get_value("phonetic_filter"):
-        dpg.delete_item("phonetic_filter")   
-    if dpg.get_value("semantic_applied"):
-        dpg.delete_item("semantic_applied")
-    if dpg.get_value("semantic_filter"):
-        dpg.delete_item("semantic_filter")   
-    if dpg.get_value("string_edit_applied"):
-        dpg.delete_item("string_edit_applied")
-    if dpg.get_value("string_edit_filter"):
-        dpg.delete_item("string_edit_filter")
-    if dpg.get_value("syllable_applied"):
-        dpg.delete_item("syllable_applied")
-    if dpg.get_value("syllable_filter"):
-        dpg.delete_item("syllable_filter")
-    if dpg.get_value("meter_applied"):
-        dpg.delete_item("meter_applied")
-    if dpg.get_value("meter_filter"):
-        dpg.delete_item("meter_filter")
-    if dpg.get_value("rhyme_applied"):
-        dpg.delete_item("rhyme_applied")
-    if dpg.get_value("rhyme_filter"):
-        dpg.delete_item("rhyme_filter")
-    if dpg.get_value("palindrome_applied"):
-        dpg.delete_item("palindrome_applied")
-    if dpg.get_value("palindrome_filter"):
-        dpg.delete_item("palindrome_filter")
-    if dpg.get_value("anagram_applied"):
-        dpg.delete_item("anagram_applied")
-    if dpg.get_value("anagram_filter"):
-        dpg.delete_item("anagram_filter")                                                                                         
-    if dpg.get_value("partial_anagram_applied"):
-        dpg.delete_item("partial_anagram_applied")
-    if dpg.get_value("partial_anagram_filter"):
-        dpg.delete_item("partial_anagram_filter")
-    if dpg.get_value("isogram_applied"):
-        dpg.delete_item("isogram_applied")
-    if dpg.get_value("isogram_filter"):
-        dpg.delete_item("isogram_filter")   
-    if dpg.get_value("reverse_isogram_applied"):
-        dpg.delete_item("reverse_isogram_applied")
-    if dpg.get_value("reverse_isogram_filter"):
-        dpg.delete_item("reverse_isogram_filter")                                     
+    for filter_name in filters:
+        if dpg.get_value(filter_name):
+            dpg.delete_item(filter_name)
+
     edit_string_callback()
     #TODO: Finish this
 
@@ -1037,9 +908,10 @@ with dpg.window(tag = "main_window", label="CTGS - Contrained Text Generation St
         dpg.add_text("Enter the name of the pre-trained model from transformers that we are using for Text Generation")
         _help("Make sure torch.cuda.is_available returns True to get GPU support for your models, which significantly speeds them up!")
         dpg.add_text("This will download a new model, so it may take awhile or even break if the model is too large")
-        dpg.add_input_text(tag = "model_name", width = 500, height = 500, default_value="distilgpt2", label = "Huggingface Model Name")
+        dpg.add_input_text(tag = "model_name", width = 500, height = 500, default_value="EleutherAI/pythia-1b", label = "Huggingface Model Name")
         dpg.add_button(tag="load_model", label="load_model", callback=load_model)
         _help("If ran from the commnad line, you can see the downloading progress in the terminal. Be patient, it can take awhile to download a model!")
+        dpg.add_checkbox(tag="8bit", label = "Enable 8 bit quantization for this model?")
     with dpg.window(tag="Filter Options", label = "Filters", show = True, pos = (1100, 300), no_close = True) as filter_options:
         dpg.add_text("Select which filters you want to enable")
         dpg.add_text("List of enabled filters: ")
@@ -1275,7 +1147,7 @@ with dpg.handler_registry():
     dpg.add_key_press_handler(key = 113, callback=tab_key_generate_tokens_callback) ##F2 inserts most likely token
     dpg.add_key_press_handler(key = 112, callback=edit_string_callback) ##F1 generates new tokens
 
-load_model(the_name="distilgpt2")
+load_model(the_name="EleutherAI/pythia-1b")
 
 edit_string_callback()
 dpg.set_global_font_scale(1.0)

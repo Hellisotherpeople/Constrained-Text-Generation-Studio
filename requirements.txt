@@ -1,8 +1,12 @@
 dearpygui
+numpy==1.19
 torch
 transformers
-abydos
+accelerate
+bitsandbytes
 fasttext
 huggingface_hub
 scipy
 pronouncing
+streamlit
+joblib
