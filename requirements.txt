@@ -10,3 +10,4 @@ scipy
 pronouncing
 streamlit
 joblib
+screeninfo
