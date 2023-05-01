@@ -17,6 +17,7 @@ from transformers import (AutoModelForCausalLM, AutoModelForQuestionAnswering,
                           AutoModelForSequenceClassification, AutoTokenizer,
                           GPT2Tokenizer, LogitsProcessor, LogitsProcessorList,
                           pipeline, top_k_top_p_filtering)
+from screeninfo import get_monitors
 
 ##TODO: Allow more semantic, phonetic, lexical models (Maybe allow specification of fasttext weights, dropdown select some phonetic models)
 ##TODO: Loading Bars when loading model, and when generating text
@@ -61,15 +62,17 @@ def load_model(the_name):
     else:
         model_name = the_name
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    if dpg.get_value("8bit"):
+    if dpg.get_value("percision") == "8bit":
         model = AutoModelForCausalLM.from_pretrained(model_name, device_map='auto', load_in_8bit=True)
+    elif dpg.get_value("percision") == "16bit":
+        model = AutoModelForCausalLM.from_pretrained(model_name, device_map='auto', load_in_8bit=False, torch_dtype=torch.float16)
     else:
         model = AutoModelForCausalLM.from_pretrained(model_name, device_map='auto', load_in_8bit=False)
     if torch.cuda.is_available():
-        loaded_model_string = model_name + " Loaded Succesfully onto the GPU"
+        loaded_model_string = model_name + " Loaded Succesfully onto the GPU" + " with " + dpg.get_value("percision") + " percision"
         dpg.add_text(parent = "load_model_window", default_value = loaded_model_string)
     else:
-        loaded_model_string = model_name + " Loaded Succesfully onto the CPU"
+        loaded_model_string = model_name + " Loaded Succesfully onto the CPU" + " with " + dpg.get_value("percision") + " percision"
         dpg.add_text(parent = "load_model_window", default_value = loaded_model_string)
 
 
@@ -263,7 +266,6 @@ reverse_isogram_count = 0
 
 def get_next_word_without_e(sequence):
     all_letters_filtered_list = []
-    #print(tokenizer)
     with torch.no_grad():
         input_ids = tokenizer.encode(sequence, return_tensors="pt")
         # get logits of last hidden state
@@ -284,17 +286,10 @@ def get_next_word_without_e(sequence):
             filtered_next_token_candidates_logits = next_token_candidates_logits
         # sample and get a probability distribution
         probs = F.softmax(filtered_next_token_candidates_logits.float(), dim=-1).sort(descending = True)
-        #next_token_candidates = torch.multinomial(probs, num_samples=number_of_tokens_to_sample) ## 10000 random samples
-        #print(next_token_candidates)
         word_list = []
-        #token_representation = tokenizer.convert_ids_to_tokens(probs[1][0])
-        #print(token_representation[0:5])
         resulting_strings = tokenizer.batch_decode(probs[1][0])
-        #print(probs[0][0][0].item())
-            #print(probs[1])## the indicies, probs[0] is the probabilities
         for iter, resulting_string in enumerate(resulting_strings):
             probability = probs[0][0][iter].item()
-            ##TODO: Consider implementing transforms inspired by stuff in the itertools/moreitertools libraries
             if dpg.get_value("upper_case_transform"):
                 resulting_string = resulting_string.upper()
             if dpg.get_value("lower_case_transform"):
@@ -369,10 +364,10 @@ def tab_key_generate_tokens_callback():
     if dpg.get_value("greedy_decoding"):
         returned_word = generated_output[0][0]
     else:
-        probability_weights = list(zip(*generated_output))[1]
+        probability_weights = tuple(zip(*generated_output))[1]
         returned_word = random.choices(generated_output, weights = probability_weights, k = 1)[0][0]    
-    new_string = string_input + returned_word
-    new_value = dpg.set_value("input_string", new_string)
+    string_input += returned_word
+    dpg.set_value("input_string", string_input)
 
 def generate_tokens_callback():
     number_of_tokens = dpg.get_value("num_tokens_to_generate")
@@ -867,8 +862,13 @@ def turn_filters_off_callback():
 
 
 dpg.create_context()
-dpg.create_viewport(width = 1920, height = 1080)
+monitor = get_monitors()[0]
+screen_width = monitor.width
+screen_height = monitor.height
+dpg.create_viewport(width=screen_width, height=screen_height)
 dpg.setup_dearpygui()
+dpg.toggle_viewport_fullscreen()
+
 #dpg.configure_app(docking=True, dock_space = True)
 
 dpg.enable_docking(dock_space=True)
@@ -879,6 +879,14 @@ with dpg.font_registry():
     )
 
 dpg.bind_font(font)
+readme_pos = ((screen_width) // 2, (screen_height) // 2)
+window_size = (screen_width // 2, screen_height // 2.5)
+window_positions = [
+    (0, 0),
+    (window_size[0], window_size[1]),
+    (window_size[0] * 2, 0),
+    (window_size[0], 0),
+]
 
 
 """
@@ -899,20 +907,20 @@ def edited_call(sender, app_data, user_data):
 #edit_string_callback("This is an example")
 
 
-with dpg.window(tag = "main_window", label="CTGS - Contrained Text Generation Studio", no_close = True, width = 1000) as window:
+with dpg.window(tag="main_window", label="CTGS - Contrained Text Generation Studio", no_close=True, width=window_size[0], height=window_size[1], pos=window_positions[0]) as window:
     dpg.add_text("Main Text Box")
     dpg.add_text("Right Click within the text box for LM recommended continuations with constraints applied!")
     dpg.add_input_text(tag = "input_string", width = 900, height = 500, multiline=True, default_value = "Type something here!")
 
-    with dpg.window(tag = "load_model_window", label = "Model Settings", pos = (1100, 200), no_close = True) as model_window:
+    with dpg.window(tag="load_model_window", label="Model Settings", no_close=True, width=window_size[0], height=window_size[1], pos=window_positions[1]) as model_window:
         dpg.add_text("Enter the name of the pre-trained model from transformers that we are using for Text Generation")
         _help("Make sure torch.cuda.is_available returns True to get GPU support for your models, which significantly speeds them up!")
         dpg.add_text("This will download a new model, so it may take awhile or even break if the model is too large")
         dpg.add_input_text(tag = "model_name", width = 500, height = 500, default_value="EleutherAI/pythia-1b", label = "Huggingface Model Name")
         dpg.add_button(tag="load_model", label="load_model", callback=load_model)
         _help("If ran from the commnad line, you can see the downloading progress in the terminal. Be patient, it can take awhile to download a model!")
-        dpg.add_checkbox(tag="8bit", label = "Enable 8 bit quantization for this model?")
-    with dpg.window(tag="Filter Options", label = "Filters", show = True, pos = (1100, 300), no_close = True) as filter_options:
+        dpg.add_combo(items=["32bit", "16bit", "8bit"], tag = "percision", label = "Select the model percision", default_value ="32bit")
+    with dpg.window(tag="Filter Options", label="Filters", show=True, no_close=True, width=window_size[0], height=window_size[1], pos=window_positions[2]) as filter_options:
         dpg.add_text("Select which filters you want to enable")
         dpg.add_text("List of enabled filters: ")
         dpg.add_checkbox(tag="lipogram", label = "All Strings Banned", callback=lipogram_callback)
@@ -990,7 +998,6 @@ with dpg.window(tag = "main_window", label="CTGS - Contrained Text Generation St
             dpg.add_text("Specify the length that you want your strings to be greater than")
             dpg.add_input_int(tag = "length_gt_constrained_number", label = "Number to constrain the length to be greater than")
             dpg.add_button(tag="length_gt_constrained_button", label="Load Length Constrained String", callback=load_string_length_gt_constrained_callback)
-
 
         dpg.add_checkbox(tag="length_lt", label = "String Length Lesser Than", callback = string_length_lt_constrained_callback)
         _help("This allows one to guarantee that the string will be shorter than particular length\n" "NOTE: It's recommended to combine this filter with whitespace stripping")
@@ -1099,7 +1106,7 @@ with dpg.window(tag = "main_window", label="CTGS - Contrained Text Generation St
     dpg.add_checkbox(tag="greedy_decoding", label = "Enable greedy decoding?")
     _help("This will override top-p and top-k sampling and only select the most likely token everytime")
     
-    with dpg.window(tag="Transforms", show = True, label = "Text Transforms", pos = (1100, 1000), no_close = True) as pre_filter_options:
+    with dpg.window(tag="Transforms", show=True, label="Text Transforms", no_close=True, width=window_size[0], height=window_size[1], pos=window_positions[3]) as pre_filter_options:
         dpg.add_text("These are text transforms which will apply to all tokens *before* the actual filters are applied")
         dpg.add_text("Using these transforms will frequently assist with increasing the vocabulary that is available after a filter is applied")
         dpg.add_text("These transforms can also prevent generation of undesierable characters")
@@ -1128,7 +1135,7 @@ with dpg.window(tag = "main_window", label="CTGS - Contrained Text Generation St
         dpg.add_checkbox(tag = "filter_blank_outputs", label = "Filter blank outputs")
         _help("After applying some other transforms, there may be leftover blanks. This will remove them")
 
-    with dpg.window(tag="Readme", show = True, label = "Read Me First", pos = (500, 500), no_close = False) as read_me_options:
+    with dpg.window(tag="Readme", show=True, label="Read Me First", no_close=False, pos=readme_pos) as read_me_options:
         dpg.add_text(default_value ="Usage tips:")
         dpg.add_text(default_value="The first time you run this, it may take a few minutes to be ready to run because distilgpt2 and fasttext are being downloaded from huggingface. Wait until you see a messege in the Model Settings window about it being succesfully loaded before trying to run CTGS.", bullet = True)
         dpg.add_text(default_value ="Right click anywhere within the text box for a list of continuations with the enabled filters to appear", bullet = True)
