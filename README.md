@@ -77,6 +77,19 @@ Not all language models have the same kinds of vocabulary. Most vocabularies inc
 * **Filter blank outputs** - After applying some other transforms, there may be leftover blanks. This will remove them
 
 
+### Future Features
+
+CTGS will massively benefit from the addition of several other features, which I am trying to add as my time allows, but with professional obligations this will be difficult to do as quickly as I'd like. For now, enumerating them here will hopefully plique a motivated persons interest to help knock these out and improve CTGS if I can't get to it in time. 
+
+* **Refactor all filters to utilize the built in Logitsprocessor class from Huggingface**. This will make generation 10-100x as fast depending on the filter, and allow better support for all of the new techniques for sampling (like typicality or contrastive sampling)
+* **Support for Sequence Level Constraints** Huggingface has had support for sequence level constrained beam search for awhile now, but hardly anyone is using it despite its power. We can combine these sequence level constraints with token level constraints. 
+* **Ability to downweight or upweight token/logit probabilities instead of simply filtering**. This was an obvious feature that I should have included in the beginning. It's quite interesting to ban tokens which violate a filter, but it's also interesting to see how models react when they are simply nudged away or towards a particular constraint/filter instead. Particularly good for not totally kneecapping a models ability to generate coherent text. 
+* **Support for "Stateful" Constraints** Meaning constraints which rely on the input in some way. For example, a "Trumpify" constraint could capitalize every 5th generated word and always add a ton of excalmation points, so this would need to keep track of how many words have been generated before deciding to capitalize and when the sentence is about to end.
+* **Support for "Subword Aware" Constraints** Many constraints (e.g. the rhyme constraint) implicitly assume that a model will generate a full word at every timestep. This assumption is often not the case, and it would be nice if the constraint would know if it is about to generate a full word or if it is generating a part of the next word. The logic for this is surprsingly tricky, especially since models don't have a universally agreed upon "seperating character", and these characters are sometimes not even explicitly mentioned in documentation. For GPT-2, this character is "Ġ". 
+* **Support for Masked Language Modeling and Sequence to Sequence models** I've already tested and know that this works, just need to implement it here. This also means that a user should be able to specify where their generated text should be inserted into the input, allowing for text "inpainting" or "outpainting"
+* **Support for other prompt engineering techniques** Things like LangChain integration, implementation of prompt weighting, attention emphasis, and other tricks that were mostly pioneered in the Stable Diffusion ecosystem. 
+* **Better UI/UX** DearPyGUI is extremely powerful, but I don't take good advantage of all of its features. There are many places where graphs/charts would be useful, and the UI design could be much better. 
+
 # Install Instructions
 
 1.  Clone the repo
@@ -115,5 +128,3 @@ After typing or copying/pasting text into the text box, use the Predict New Toke
 This utility is written using the DearPyGUI GUI library, and has the tiling mode enabled. You can move around the windows and tile them with each other to your hearts desire. I think a tool like this is a natural fit for a tiling window manager style layout
 
 Hovering over a green question-mark will pop-up a tooltip to give you context/help
-
-# Screenshots
