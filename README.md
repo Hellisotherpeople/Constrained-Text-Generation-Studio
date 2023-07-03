@@ -20,7 +20,7 @@ CTGS allows users to generate or choose from text with any combination of a wide
 
 CTGS uses an extremely simple and intuitive algorithm. At each generation, a language model is actually sampling from a probability distribution of its entire vocabulary (which is usually tokenized sub-words). **Why don't we just ban the tokens within the vocabulary which violate the chosen constraints before the sampling step?**. This has two advantages over fine-tuning. The first advantage is that the model will never violate the imposed constraint, which is unfortunately impossible to guarantee for a fine-tuned model alone. The second advantage is that on constrained writing datasets, this technique results in strictly superior preplexity over fine-tuning alone (which makes sense because we are literally banning errrors). 
 
-CTGS, along with the related contributions of its [datasets](https://huggingface.co/datasets/Hellisotherpeople/Lipogram-e), and a huggingface "space" webapp called [Gadsby](https://huggingface.co/spaces/Hellisotherpeople/Gadsby), are all presented as part of our paper titled ["Most Language Models can be Poets too: An AI Writing Assistant and Constrained Text Generation Studio"](https://drive.google.com/file/d/1lTZX5_Ef0nsOXj7s1x_S7LPdgYvzcp-g/view) to appear at [The Second Workshop on When Creative AI Meets Conversational AI (CAI2)](https://sites.google.com/view/cai-workshop-2022), jointly held at [The 29th International Conference on Computational Linguistics (COLING 2022)](https://coling2022.org/)
+CTGS, along with the related contributions of its [datasets](https://huggingface.co/datasets/Hellisotherpeople/Lipogram-e), and a Hugging Face "space" webapp called [Gadsby](https://huggingface.co/spaces/Hellisotherpeople/Gadsby), are all presented as part of our paper titled ["Most Language Models can be Poets too: An AI Writing Assistant and Constrained Text Generation Studio"](https://drive.google.com/file/d/1lTZX5_Ef0nsOXj7s1x_S7LPdgYvzcp-g/view) to appear at [The Second Workshop on When Creative AI Meets Conversational AI (CAI2)](https://sites.google.com/view/cai-workshop-2022), jointly held at [The 29th International Conference on Computational Linguistics (COLING 2022)](https://coling2022.org/)
 
 # Features
 
@@ -28,7 +28,7 @@ CTGS consists of 3 main components, the model, the filters, and the text transfo
 
 ### HF Integration
 
-CTGS supports any casual language model available on [Huggingface](https://huggingface.co/models?pipeline_tag=text-generation&sort=downloads). Future updates will add support for Masked Language Models, and for text-to-text models (which are supported at this time by [Gadsby](https://huggingface.co/spaces/Hellisotherpeople/Gadsby).
+CTGS supports any casual language model available on [Hugging Face](https://huggingface.co/models?pipeline_tag=text-generation&sort=downloads). Future updates will add support for Masked Language Models, and for text-to-text models (which are supported at this time by [Gadsby](https://huggingface.co/spaces/Hellisotherpeople/Gadsby).
 
 ### Filters 
 
@@ -81,8 +81,8 @@ Not all language models have the same kinds of vocabulary. Most vocabularies inc
 
 CTGS will massively benefit from the addition of several other features, which I am trying to add as my time allows, but with professional obligations this will be difficult to do as quickly as I'd like. For now, enumerating them here will hopefully plique a motivated persons interest to help knock these out and improve CTGS if I can't get to it in time. 
 
-* **Refactor all filters to utilize the built in Logitsprocessor class from Huggingface**. This will make generation 10-100x as fast depending on the filter, and allow better support for all of the new techniques for sampling (like typicality or contrastive sampling)
-* **Support for Sequence Level Constraints** Huggingface has had support for sequence level constrained beam search for awhile now, but hardly anyone is using it despite its power. We can combine these sequence level constraints with token level constraints. 
+* **Refactor all filters to utilize the built in Logitsprocessor class from Hugging Face**. This will make generation 10-100x as fast depending on the filter, and allow better support for all of the new techniques for sampling (like typicality or contrastive sampling)
+* **Support for Sequence Level Constraints** Hugging Face has had support for sequence level constrained beam search for awhile now, but hardly anyone is using it despite its power. We can combine these sequence level constraints with token level constraints. 
 * **Ability to downweight or upweight token/logit probabilities instead of simply filtering**. This was an obvious feature that I should have included in the beginning. It's quite interesting to ban tokens which violate a filter, but it's also interesting to see how models react when they are simply nudged away or towards a particular constraint/filter instead. Particularly good for not totally kneecapping a models ability to generate coherent text. 
 * **Allow filter-by-filter modification of the constraints to avoid removing punctuation, spaces, or numbers** Doing this will make it far eaiser for models to stay coherent even while following constraints. Just because we are forcing the letter "a" doesn't necessarily mean that space or puctuation should be filtered
 * **Support for "Stateful" Constraints** Meaning constraints which rely on the input in some way. For example, a "Trumpify" constraint could capitalize every 5th generated word and always add a ton of excalmation points, so this would need to keep track of how many words have been generated before deciding to capitalize and when the sentence is about to end.
@@ -100,7 +100,7 @@ CTGS will massively benefit from the addition of several other features, which I
 
 # Usage Instructions
 
-The first time you run this, it may take a few minutes to be ready to run because distilgpt2 and fasttext are being downloaded from huggingface. Wait until you see a messege in the Model Settings window about it being succesfully loaded before trying to run CTGS
+The first time you run this, it may take a few minutes to be ready to run because distilgpt2 and fasttext are being downloaded from Hugging Face. Wait until you see a messege in the Model Settings window about it being succesfully loaded before trying to run CTGS
 
 ![](pictures/load_modal.JPG)
 
