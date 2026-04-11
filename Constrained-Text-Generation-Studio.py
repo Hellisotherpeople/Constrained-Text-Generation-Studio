@@ -88,8 +88,19 @@ class ModelState:
     name: str = ""
 
 
+@dataclass
+class AnalysisState:
+    """Holds last generation results for visualization (no extra model calls)."""
+    all_candidates: list = field(default_factory=list)
+    passing_candidates: list = field(default_factory=list)
+    failing_candidates: list = field(default_factory=list)
+    per_constraint_stats: dict = field(default_factory=dict)
+    generation_history: list = field(default_factory=list)
+
+
 constraints = ConstraintState()
 model_state = ModelState()
+analysis_state = AnalysisState()
 phonetic_encoder = Metaphone()
 fasttext_model = None
 _dynamic_tags = []  # tracks filter status tags for cleanup on reset
@@ -180,6 +191,61 @@ def passes_all_constraints(word, cs):
                 return False
 
     return True
+
+
+def _compute_per_constraint_stats(word_list):
+    """For each active constraint, count how many tokens it alone would reject."""
+    stats = {}
+    checks = []
+    cs = constraints
+    if cs.lipogram_banned_list:
+        checks.append(("All Strings Banned", ConstraintState(lipogram_banned_list=cs.lipogram_banned_list)))
+    if cs.weak_lipogram_banned_list:
+        checks.append(("Any Strings Banned", ConstraintState(weak_lipogram_banned_list=cs.weak_lipogram_banned_list)))
+    if cs.reverse_lipogram_required_list:
+        checks.append(("All Strings Required", ConstraintState(reverse_lipogram_required_list=cs.reverse_lipogram_required_list)))
+    if cs.weak_reverse_lipogram_required_list:
+        checks.append(("Any Strings Required", ConstraintState(weak_reverse_lipogram_required_list=cs.weak_reverse_lipogram_required_list)))
+    if cs.string_in_position_list:
+        checks.append(("String In Position", ConstraintState(string_in_position_list=cs.string_in_position_list, string_in_position_index_list=cs.string_in_position_index_list)))
+    if cs.starts_with_string:
+        checks.append(("Starts With", ConstraintState(starts_with_string=cs.starts_with_string)))
+    if cs.ends_with_string:
+        checks.append(("Ends With", ConstraintState(ends_with_string=cs.ends_with_string)))
+    if cs.constrained_length > 0:
+        checks.append(("Length Equal To", ConstraintState(constrained_length=cs.constrained_length)))
+    if cs.constrained_gt_length > 0:
+        checks.append(("Length Greater Than", ConstraintState(constrained_gt_length=cs.constrained_gt_length)))
+    if cs.constrained_lt_length > 0:
+        checks.append(("Length Less Than", ConstraintState(constrained_lt_length=cs.constrained_lt_length)))
+    if cs.palindrome_enabled:
+        checks.append(("Palindrome", ConstraintState(palindrome_enabled=True)))
+    if cs.phonetic_matching_string:
+        checks.append(("Phonetic", ConstraintState(phonetic_matching_string=cs.phonetic_matching_string)))
+    if cs.semantic_matching_string:
+        checks.append(("Semantic", ConstraintState(semantic_matching_string=cs.semantic_matching_string, semantic_distance_threshold=cs.semantic_distance_threshold)))
+    if cs.anagram_string:
+        checks.append(("Anagram", ConstraintState(anagram_string=cs.anagram_string)))
+    if cs.partial_anagram_string:
+        checks.append(("Partial Anagram", ConstraintState(partial_anagram_string=cs.partial_anagram_string)))
+    if cs.rhyme_string:
+        checks.append(("Rhyme", ConstraintState(rhyme_string=cs.rhyme_string)))
+    if cs.meter_string:
+        checks.append(("Meter", ConstraintState(meter_string=cs.meter_string)))
+    if cs.string_edit_string:
+        checks.append(("Edit Distance", ConstraintState(string_edit_string=cs.string_edit_string, string_edit_distance_threshold=cs.string_edit_distance_threshold)))
+    if cs.syllable_number > 0:
+        checks.append(("Syllable Count", ConstraintState(syllable_number=cs.syllable_number)))
+    if cs.isogram_count > 0:
+        checks.append(("Isogram", ConstraintState(isogram_count=cs.isogram_count)))
+    if cs.reverse_isogram_count > 0:
+        checks.append(("Reverse Isogram", ConstraintState(reverse_isogram_count=cs.reverse_isogram_count)))
+
+    for name, temp_cs in checks:
+        rejected = sum(1 for w in word_list if not passes_all_constraints(w, temp_cs))
+        stats[name] = rejected
+
+    return stats
 
 
 # ============================================================================
@@ -282,10 +348,11 @@ def get_constrained_tokens(sequence):
 
             top_p = dpg.get_value("top_p")
             top_k = dpg.get_value("top_k")
-            # If user left both at 0 (no filtering), use a sensible default
-            # to avoid processing the entire 50k+ token vocabulary
+            # If user left both at 0, use the configurable default vocabulary size
             if top_k == 0 and top_p == 0.0:
-                top_k = 500
+                default_vocab = dpg.get_value("default_vocab_size")
+                if default_vocab > 0:
+                    top_k = default_vocab
             strength = dpg.get_value("constraint_strength")
             use_relaxation = dpg.get_value("progressive_relaxation")
             has_constraints = constraints.has_active_constraints()
@@ -324,13 +391,21 @@ def get_constrained_tokens(sequence):
                     word_list.append((text, prob))
 
                 if not has_constraints:
+                    analysis_state.all_candidates = word_list
+                    analysis_state.passing_candidates = word_list
+                    analysis_state.failing_candidates = []
+                    analysis_state.per_constraint_stats = {}
                     return word_list
 
                 # Apply constraints with strength control
                 if strength >= 1.0:
                     filtered = [w for w in word_list if passes_all_constraints(w, constraints)]
+                    passing = filtered
+                    failing = [w for w in word_list if w not in filtered]
                 elif strength <= 0.0:
                     filtered = word_list
+                    passing = word_list
+                    failing = []
                 else:
                     passing = []
                     failing = []
@@ -339,6 +414,12 @@ def get_constrained_tokens(sequence):
                     penalty_factor = 1.0 - strength
                     filtered = passing + [(t, p * penalty_factor) for t, p in failing]
                     filtered.sort(key=lambda x: x[1], reverse=True)
+
+                # Populate analysis state for visualization (no extra model call)
+                analysis_state.all_candidates = word_list
+                analysis_state.passing_candidates = passing
+                analysis_state.failing_candidates = failing
+                analysis_state.per_constraint_stats = _compute_per_constraint_stats(word_list)
 
                 if filtered:
                     return filtered
@@ -392,17 +473,23 @@ def refresh_token_popup(*args):
     dpg.add_separator(parent="token_popup")
 
     if candidates:
-        for text, prob in candidates[:200]:
+        max_display = dpg.get_value("max_display_tokens")
+        show_all = dpg.get_value("show_all_tokens")
+        display_list = candidates if (show_all or max_display == 0) else candidates[:max_display]
+        for text, prob in display_list:
             dpg.add_selectable(
                 label=f"{text}  ({prob:.2%})",
                 user_data=text,
                 callback=_add_word_callback,
                 parent="token_popup"
             )
-        dpg.set_value("status_text", f"Ready - {len(candidates)} candidates")
+        dpg.set_value("status_text", f"Ready - {len(candidates)} candidates (showing {len(display_list)})")
     else:
         dpg.add_text("No results with current constraints", parent="token_popup")
         dpg.set_value("status_text", "No tokens match current constraints")
+
+    # Update analysis visualizations (no extra model call)
+    _refresh_analysis()
 
 
 def _add_word_callback(sender, app_data, user_data):
@@ -460,6 +547,8 @@ def _generate_tokens_worker():
     history = []
     backtracks_used = 0
     tokens_generated = 0
+    prev_backtracks = 0
+    analysis_state.generation_history = []
 
     while tokens_generated < num_tokens:
         candidates = get_constrained_tokens(text)
@@ -492,6 +581,10 @@ def _generate_tokens_worker():
             chosen = candidates[idx]
             remaining = [c for j, c in enumerate(candidates) if j != idx][:5]
 
+        was_backtrack = backtracks_used > prev_backtracks
+        prev_backtracks = backtracks_used
+        analysis_state.generation_history.append((chosen[0], chosen[1], was_backtrack))
+
         history.append((text, remaining))
         text += chosen[0]
         tokens_generated += 1
@@ -499,6 +592,7 @@ def _generate_tokens_worker():
         dpg.set_value("status_text", f"Generated {tokens_generated}/{num_tokens} tokens")
 
     dpg.set_value("status_text", f"Done! Generated {num_tokens} tokens")
+    _refresh_history_plot()
 
 
 def load_model_callback(sender=None, app_data=None, user_data=None, model_name_override=None):
@@ -564,6 +658,182 @@ def turn_filters_off_callback(*args):
         if dpg.does_item_exist(tag):
             dpg.delete_item(tag)
     dpg.set_value("status_text", "All filters reset")
+
+
+# ============================================================================
+# Analysis & Visualization Callbacks
+# ============================================================================
+
+def _refresh_analysis(*args):
+    """Rebuild all analysis visualizations from the last generation results."""
+    _refresh_bar_chart()
+    _refresh_pie_chart()
+    _refresh_constraint_breakdown()
+    _refresh_token_table()
+
+
+def _refresh_bar_chart():
+    """Update the token probability bar chart."""
+    if not dpg.does_item_exist("prob_bar_y"):
+        return
+    dpg.delete_item("prob_bar_y", children_only=True)
+
+    n = dpg.get_value("chart_top_n")
+    top_n = analysis_state.all_candidates[:n]
+    if not top_n:
+        return
+
+    passing_set = set(t for t, p in analysis_state.passing_candidates)
+    pass_x, pass_y, fail_x, fail_y = [], [], [], []
+    tick_labels = []
+
+    for i, (text, prob) in enumerate(top_n):
+        label = text.replace(" ", "\u2423").replace("\n", "\\n")[:12]
+        tick_labels.append((label, float(i)))
+        if text in passing_set:
+            pass_x.append(float(i))
+            pass_y.append(prob)
+        else:
+            fail_x.append(float(i))
+            fail_y.append(prob)
+
+    if pass_x:
+        dpg.add_bar_series(pass_x, pass_y, label="Pass", parent="prob_bar_y", tag="bar_pass_s")
+        if dpg.does_item_exist("green_bar_theme"):
+            dpg.bind_item_theme("bar_pass_s", "green_bar_theme")
+    if fail_x:
+        dpg.add_bar_series(fail_x, fail_y, label="Fail", parent="prob_bar_y", tag="bar_fail_s")
+        if dpg.does_item_exist("red_bar_theme"):
+            dpg.bind_item_theme("bar_fail_s", "red_bar_theme")
+
+    if dpg.does_item_exist("prob_bar_x"):
+        dpg.set_axis_ticks("prob_bar_x", tick_labels)
+
+
+def _refresh_pie_chart():
+    """Update the pass/fail pie chart."""
+    if not dpg.does_item_exist("pie_y"):
+        return
+    dpg.delete_item("pie_y", children_only=True)
+
+    n_pass = len(analysis_state.passing_candidates)
+    n_fail = len(analysis_state.failing_candidates)
+    n_total = n_pass + n_fail
+
+    if n_total == 0:
+        dpg.set_value("constraint_summary_text", "No data yet")
+        return
+
+    pct = n_pass / n_total * 100
+    dpg.set_value("constraint_summary_text",
+                  f"{n_pass} of {n_total} tokens pass ({pct:.1f}%)")
+
+    dpg.add_pie_series(0.5, 0.5, 0.4,
+                       [float(n_pass), float(n_fail)],
+                       ["Pass", "Fail"],
+                       parent="pie_y", normalize=True, format="%0.1f%%")
+    dpg.set_axis_limits("pie_x", 0, 1)
+    dpg.set_axis_limits("pie_y", 0, 1)
+
+
+def _refresh_constraint_breakdown():
+    """Show how many tokens each individual constraint filters."""
+    if not dpg.does_item_exist("constraint_breakdown_group"):
+        return
+    dpg.delete_item("constraint_breakdown_group", children_only=True)
+
+    stats = analysis_state.per_constraint_stats
+    total = len(analysis_state.all_candidates)
+    if not stats or total == 0:
+        dpg.add_text("No active constraints", parent="constraint_breakdown_group",
+                      color=[180, 180, 180])
+        return
+
+    for name, count in sorted(stats.items(), key=lambda x: x[1], reverse=True):
+        pct = count / total * 100
+        dpg.add_text(f"{name}: filters {count}/{total} ({pct:.1f}%)",
+                     parent="constraint_breakdown_group")
+        dpg.add_progress_bar(default_value=count / total, overlay=f"{count}/{total}",
+                             width=-1, parent="constraint_breakdown_group")
+
+
+def _refresh_token_table(*args):
+    """Rebuild the token table from analysis_state."""
+    if not dpg.does_item_exist("token_table"):
+        return
+    # Delete rows (slot=1) but keep column headers (slot=0)
+    dpg.delete_item("token_table", children_only=True, slot=1)
+
+    passing_set = set(t for t, p in analysis_state.passing_candidates)
+    search_filter = dpg.get_value("token_search_input").lower() if dpg.does_item_exist("token_search_input") else ""
+
+    max_rows = dpg.get_value("max_display_tokens") if dpg.does_item_exist("max_display_tokens") else 200
+    show_all = dpg.get_value("show_all_tokens") if dpg.does_item_exist("show_all_tokens") else False
+    candidates = analysis_state.all_candidates
+    if not show_all and max_rows > 0:
+        candidates = candidates[:max_rows]
+
+    for rank, (text, prob) in enumerate(candidates, 1):
+        if search_filter and search_filter not in text.lower():
+            continue
+        passes = text in passing_set
+        with dpg.table_row(parent="token_table"):
+            dpg.add_text(str(rank))
+            dpg.add_selectable(label=text, callback=_table_insert_token,
+                               user_data=text, span_columns=False)
+            dpg.add_text(f"{prob:.4%}")
+            dpg.add_text("Yes" if passes else "No",
+                         color=[60, 180, 75] if passes else [200, 60, 60])
+
+
+def _table_insert_token(sender, app_data, user_data):
+    """Insert a token from the table into the input text."""
+    current = dpg.get_value("input_string")
+    dpg.set_value("input_string", current + str(user_data))
+
+
+def _refresh_history_plot(*args):
+    """Update the generation history line plot."""
+    if not dpg.does_item_exist("history_y"):
+        return
+    dpg.delete_item("history_y", children_only=True)
+
+    hist = analysis_state.generation_history
+    if not hist:
+        return
+
+    xs = [float(i) for i in range(len(hist))]
+    ys = [h[1] for h in hist]
+
+    dpg.add_line_series(xs, ys, label="Token probability", parent="history_y")
+
+    # Mark backtrack points with scatter markers
+    bt_xs = [float(i) for i, h in enumerate(hist) if h[2]]
+    bt_ys = [h[1] for h in hist if h[2]]
+    if bt_xs:
+        dpg.add_scatter_series(bt_xs, bt_ys, label="Backtrack", parent="history_y")
+
+    tick_labels = [(h[0].replace(" ", "")[:8], float(i)) for i, h in enumerate(hist)]
+    if tick_labels and dpg.does_item_exist("history_x"):
+        dpg.set_axis_ticks("history_x", tick_labels)
+
+
+def _save_text_callback(sender, app_data):
+    """Save current text to a file."""
+    filepath = app_data.get("file_path_name", "")
+    if filepath:
+        with open(filepath, "w") as f:
+            f.write(dpg.get_value("input_string"))
+        dpg.set_value("status_text", f"Saved to {filepath}")
+
+
+def _load_text_callback(sender, app_data):
+    """Load text from a file."""
+    filepath = app_data.get("file_path_name", "")
+    if filepath and os.path.exists(filepath):
+        with open(filepath, "r") as f:
+            dpg.set_value("input_string", f.read())
+        dpg.set_value("status_text", f"Loaded from {filepath}")
 
 
 # ============================================================================
@@ -904,6 +1174,27 @@ def main():
             dpg.add_theme_color(dpg.mvThemeCol_TabActive, (60, 110, 160))
     dpg.bind_theme(global_theme)
 
+    # Plot color themes for bar chart
+    with dpg.theme(tag="green_bar_theme"):
+        with dpg.theme_component(dpg.mvBarSeries):
+            dpg.add_theme_color(dpg.mvPlotCol_Fill, (60, 180, 75, 200))
+            dpg.add_theme_color(dpg.mvPlotCol_Line, (60, 180, 75, 255))
+    with dpg.theme(tag="red_bar_theme"):
+        with dpg.theme_component(dpg.mvBarSeries):
+            dpg.add_theme_color(dpg.mvPlotCol_Fill, (200, 60, 60, 200))
+            dpg.add_theme_color(dpg.mvPlotCol_Line, (200, 60, 60, 255))
+
+    # File dialogs
+    with dpg.file_dialog(tag="save_dialog", callback=_save_text_callback,
+                         show=False, default_filename="output.txt",
+                         width=700, height=400):
+        dpg.add_file_extension(".txt", color=(150, 255, 150))
+        dpg.add_file_extension(".*")
+    with dpg.file_dialog(tag="load_dialog", callback=_load_text_callback,
+                         show=False, width=700, height=400):
+        dpg.add_file_extension(".txt", color=(150, 255, 150))
+        dpg.add_file_extension(".*")
+
     # Layout sizes
     w = screen_width // 2
     h = int(screen_height // 2.5)
@@ -952,6 +1243,23 @@ def main():
         dpg.add_input_int(tag="max_backtracks", label="Max backtracks",
                           default_value=3, min_value=0, max_value=50)
         _help("During multi-token generation, backtrack this many times on dead ends to try alternative tokens.")
+
+        dpg.add_separator()
+        dpg.add_text("Display & Vocabulary Settings")
+        dpg.add_input_int(tag="max_display_tokens", label="Max tokens to display",
+                          default_value=200, min_value=0)
+        _help("Max tokens shown in popup and table. 0 = unlimited (may be slow).")
+        dpg.add_checkbox(tag="show_all_tokens", label="Show all tokens (override limit)")
+        _help("When checked, shows ALL candidate tokens regardless of the limit above.")
+        dpg.add_input_int(tag="default_vocab_size", label="Default vocabulary size",
+                          default_value=500, min_value=0)
+        _help("When both Top-K and Top-P are 0, use this as default Top-K. "
+              "Set to 0 to process the ENTIRE vocabulary (slow but complete).")
+
+        dpg.add_separator()
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Save Text", callback=lambda: dpg.show_item("save_dialog"))
+            dpg.add_button(label="Load Text", callback=lambda: dpg.show_item("load_dialog"))
 
         dpg.add_separator()
         dpg.add_text("Active Filters:")
@@ -1039,6 +1347,73 @@ def main():
         dpg.add_text("Windows can be rearranged, docked, and tiled. "
                       "Hover over green (?) icons for context help.")
         dpg.add_text("Close this window with the X button.")
+
+    # --- Token Analysis Window ---
+    with dpg.window(tag="analysis_window", label="Token Analysis",
+                    no_close=True, width=w * 2, height=h, pos=(0, h * 2)):
+        dpg.add_text("Token Probability Analysis", color=[120, 200, 255])
+        dpg.add_text("Updates automatically when you predict tokens (F1)", color=[180, 180, 180])
+
+        with dpg.group(horizontal=True):
+            dpg.add_input_int(tag="chart_top_n", label="Top N bars",
+                              default_value=30, min_value=5, max_value=500)
+            dpg.add_button(label="Refresh Charts", callback=_refresh_analysis)
+
+        dpg.add_separator()
+
+        # --- Bar chart: token probabilities ---
+        with dpg.plot(tag="prob_bar_plot", label="Token Probabilities (green=pass, red=fail)",
+                      height=250, width=-1):
+            dpg.add_plot_legend()
+            dpg.add_plot_axis(dpg.mvXAxis, tag="prob_bar_x", label="Token")
+            dpg.add_plot_axis(dpg.mvYAxis, tag="prob_bar_y", label="Probability")
+
+        dpg.add_separator()
+
+        # --- Constraint impact: pie chart + breakdown ---
+        dpg.add_text("Constraint Impact", color=[120, 200, 255])
+        with dpg.group(horizontal=True):
+            with dpg.child_window(width=350, height=280):
+                with dpg.plot(tag="constraint_pie_plot", label="Pass vs Fail",
+                              height=250, width=-1, equal_aspects=True,
+                              no_mouse_pos=True):
+                    dpg.add_plot_axis(dpg.mvXAxis, tag="pie_x",
+                                     no_tick_labels=True, no_tick_marks=True, no_gridlines=True)
+                    dpg.add_plot_axis(dpg.mvYAxis, tag="pie_y",
+                                     no_tick_labels=True, no_tick_marks=True, no_gridlines=True)
+            with dpg.child_window(width=-1, height=280):
+                dpg.add_text(tag="constraint_summary_text",
+                             default_value="No data yet", color=[180, 180, 180])
+                dpg.add_separator()
+                dpg.add_text("Per-Constraint Breakdown:", color=[200, 200, 100])
+                with dpg.group(tag="constraint_breakdown_group"):
+                    pass
+
+        dpg.add_separator()
+
+        # --- Token table ---
+        dpg.add_text("Token Table (click token to insert)", color=[120, 200, 255])
+        dpg.add_input_text(tag="token_search_input", label="Search tokens",
+                           width=300, callback=_refresh_token_table, on_enter=False)
+
+        with dpg.table(tag="token_table", header_row=True,
+                       resizable=True, borders_innerH=True, borders_outerH=True,
+                       borders_innerV=True, borders_outerV=True,
+                       scrollY=True, height=200, row_background=True):
+            dpg.add_table_column(label="Rank", width_fixed=True, init_width_or_weight=60)
+            dpg.add_table_column(label="Token")
+            dpg.add_table_column(label="Probability")
+            dpg.add_table_column(label="Passes", width_fixed=True, init_width_or_weight=70)
+
+        dpg.add_separator()
+
+        # --- Generation history line plot ---
+        dpg.add_text("Generation History (updates after 'Generate Tokens')", color=[120, 200, 255])
+        with dpg.plot(tag="history_plot", label="Token Confidence Over Generation",
+                      height=200, width=-1):
+            dpg.add_plot_legend()
+            dpg.add_plot_axis(dpg.mvXAxis, tag="history_x", label="Step")
+            dpg.add_plot_axis(dpg.mvYAxis, tag="history_y", label="Probability")
 
     # --- Key Bindings ---
     with dpg.handler_registry():
