@@ -1,0 +1,24 @@
+[project]
+name = "constrained-text-generation-studio"
+version = "2.0.0"
+description = "An AI writing assistant for constrained text generation using large language models"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "dearpygui>=1.11",
+    "numpy>=1.24",
+    "torch>=2.0",
+    "transformers>=4.40",
+    "accelerate>=0.27",
+    "bitsandbytes>=0.43; sys_platform != 'darwin'",
+    "fasttext-wheel>=0.9.2",
+    "huggingface_hub>=0.20",
+    "scipy>=1.11",
+    "pronouncing>=0.2.0",
+    "pyphonetics>=0.5.1",
+    "python-Levenshtein>=0.25",
+    "screeninfo>=0.8",
+]
+
+[tool.uv]
+dev-dependencies = []

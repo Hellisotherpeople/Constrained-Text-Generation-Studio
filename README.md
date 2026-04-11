@@ -101,7 +101,16 @@ Text transforms are applied to tokens **before** constraint filtering. They incr
 - Python 3.10+
 - CUDA-capable GPU recommended (CPU works but is slower)
 
-### Setup
+### Setup (uv - recommended)
+
+```bash
+git clone https://github.com/Hellisotherpeople/Constrained-Text-Generation-Studio.git
+cd Constrained-Text-Generation-Studio
+uv sync
+uv run python Constrained-Text-Generation-Studio.py
+```
+
+### Setup (pip)
 
 ```bash
 git clone https://github.com/Hellisotherpeople/Constrained-Text-Generation-Studio.git
