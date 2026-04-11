@@ -1195,225 +1195,195 @@ def main():
         dpg.add_file_extension(".txt", color=(150, 255, 150))
         dpg.add_file_extension(".*")
 
-    # Layout sizes
-    w = screen_width // 2
-    h = int(screen_height // 2.5)
+    # ===================================================================
+    # Single primary window with tabbed layout
+    # ===================================================================
+    with dpg.window(tag="main_window", label="CTGS", no_close=True):
 
-    # --- Main Text Window ---
-    with dpg.window(tag="main_window", label="CTGS - Constrained Text Generation Studio",
-                    no_close=True, width=w, height=h, pos=(0, 0)):
-        dpg.add_text("Right-click in the text box for AI-suggested continuations with constraints applied")
-        dpg.add_input_text(tag="input_string", width=-1, height=300, multiline=True,
+        # -- Top: always-visible text editor + action buttons --
+        dpg.add_input_text(tag="input_string", width=-1, height=200, multiline=True,
                            default_value="Type something here!")
-
         with dpg.popup(parent="input_string", tag="token_popup"):
             dpg.add_text("Press 'Predict New Tokens' or F1 to see suggestions")
-
-        dpg.add_text(tag="status_text", default_value="Loading model...", color=[120, 200, 120])
-        dpg.add_separator()
 
         with dpg.group(horizontal=True):
             dpg.add_button(label="Predict New Tokens (F1)", callback=refresh_token_popup)
             dpg.add_button(label="Generate Tokens (F2)", callback=generate_tokens_callback)
-
-        dpg.add_separator()
-        dpg.add_text("Sampling Settings")
-        dpg.add_slider_float(tag="top_p", label="Top-P (nucleus sampling)",
-                             default_value=0.0, min_value=0.0, max_value=1.0, format="%.2f")
-        _help("Top-p sampling chooses from the smallest set of words whose cumulative probability exceeds p. 0 = disabled.")
-        dpg.add_input_int(tag="top_k", label="Top-K sampling", default_value=0, min_value=0)
-        _help("Top-K keeps only the K most likely next words. 0 = disabled.")
-        dpg.add_slider_float(tag="temperature", label="Temperature",
-                             default_value=1.0, min_value=0.1, max_value=3.0, format="%.2f")
-        _help("Lower = more deterministic, higher = more random.")
-        dpg.add_input_int(tag="num_tokens_to_generate", label="Tokens to generate",
-                          default_value=20, min_value=1)
-        dpg.add_checkbox(tag="greedy_decoding", label="Greedy decoding")
-        _help("Always select the most likely token (overrides top-p/top-k).")
-
-        dpg.add_separator()
-        dpg.add_text("Constraint Engine Settings")
-        dpg.add_slider_float(tag="constraint_strength", label="Constraint Strength",
-                             default_value=1.0, min_value=0.0, max_value=1.0, format="%.2f")
-        _help("1.0 = hard filter (pass/fail). Lower values apply soft penalties instead, "
-              "allowing near-misses with reduced probability. Prevents vocabulary crippling.")
-        dpg.add_checkbox(tag="progressive_relaxation", label="Progressive relaxation", default_value=True)
-        _help("When enabled, automatically expands the candidate pool if constraints filter out all tokens "
-              "at the current top-k/top-p level.")
-        dpg.add_input_int(tag="max_backtracks", label="Max backtracks",
-                          default_value=3, min_value=0, max_value=50)
-        _help("During multi-token generation, backtrack this many times on dead ends to try alternative tokens.")
-
-        dpg.add_separator()
-        dpg.add_text("Display & Vocabulary Settings")
-        dpg.add_input_int(tag="max_display_tokens", label="Max tokens to display",
-                          default_value=200, min_value=0)
-        _help("Max tokens shown in popup and table. 0 = unlimited (may be slow).")
-        dpg.add_checkbox(tag="show_all_tokens", label="Show all tokens (override limit)")
-        _help("When checked, shows ALL candidate tokens regardless of the limit above.")
-        dpg.add_input_int(tag="default_vocab_size", label="Default vocabulary size",
-                          default_value=500, min_value=0)
-        _help("When both Top-K and Top-P are 0, use this as default Top-K. "
-              "Set to 0 to process the ENTIRE vocabulary (slow but complete).")
-
-        dpg.add_separator()
-        with dpg.group(horizontal=True):
             dpg.add_button(label="Save Text", callback=lambda: dpg.show_item("save_dialog"))
             dpg.add_button(label="Load Text", callback=lambda: dpg.show_item("load_dialog"))
-
-        dpg.add_separator()
-        dpg.add_text("Active Filters:")
-        with dpg.group(tag="active_filters"):
-            pass
-
-    # --- Model Settings Window ---
-    with dpg.window(tag="model_window", label="Model Settings",
-                    no_close=True, width=w, height=h, pos=(w, h)):
-        dpg.add_text("Load a causal language model from HuggingFace for text generation")
-        _help("Make sure torch.cuda.is_available() returns True for GPU acceleration!")
-        dpg.add_input_text(tag="model_name", width=-100, default_value="EleutherAI/pythia-1b",
-                           label="HuggingFace Model")
-        dpg.add_combo(items=["32bit", "16bit", "8bit"], tag="precision",
-                      label="Precision", default_value="32bit")
-        dpg.add_button(tag="load_model_btn", label="Load Model", callback=load_model_callback)
-        _help("Downloads the model from HuggingFace. Check terminal for download progress.")
-        dpg.add_loading_indicator(tag="model_loading_indicator", show=False,
-                                  style=0, radius=2.0, color=(60, 110, 160))
-        dpg.add_text(tag="model_status", default_value="No model loaded", color=[200, 200, 100])
-
-    # --- Filter Options Window ---
-    with dpg.window(tag="filter_window", label="Filters",
-                    no_close=True, width=w, height=h, pos=(w, 0)):
-        dpg.add_text("Select and configure constraint filters")
-
-        with dpg.tab_bar(tag="filter_tabs"):
-            build_all_constraints("filter_tabs")
-
-        dpg.add_separator()
-        dpg.add_button(tag="reset_filters_btn", label="Reset All Filters",
-                       callback=turn_filters_off_callback)
-
-    # --- Text Transforms Window ---
-    with dpg.window(tag="transforms_window", label="Text Transforms",
-                    no_close=True, width=w, height=h, pos=(0, h)):
-        dpg.add_text("Transforms applied to all tokens BEFORE constraint filtering")
-        dpg.add_text("Using transforms increases the vocabulary that survives filtering", color=[180, 180, 180])
-        dpg.add_separator()
-        dpg.add_checkbox(tag="upper_case_transform", label="Uppercase")
-        _help("Force all tokens to UPPERCASE")
-        dpg.add_checkbox(tag="lower_case_transform", label="Lowercase")
-        _help("Force all tokens to lowercase")
-        dpg.add_checkbox(tag="replace_spaces", label="Remove spaces")
-        _help("Remove all spaces from tokens")
-        dpg.add_checkbox(tag="lstrip_transform", label="Left strip")
-        _help("Strip whitespace from the left side")
-        dpg.add_checkbox(tag="rstrip_transform", label="Right strip")
-        _help("Strip whitespace from the right side")
-        dpg.add_checkbox(tag="strip_transform", label="Full strip")
-        _help("Strip whitespace from both sides")
-        dpg.add_checkbox(tag="capitalize_first_letter_transform", label="Capitalize first letter")
-        _help("Capitalize the first letter of each token")
-        dpg.add_checkbox(tag="alphanumeric_transform", label="Alphanumeric only")
-        _help("Keep only letters and numbers")
-        dpg.add_checkbox(tag="alpha_transform", label="Alphabetic only")
-        _help("Keep only letters")
-        dpg.add_checkbox(tag="digit_transform", label="Digits only")
-        _help("Keep only numbers")
-        dpg.add_checkbox(tag="ascii_transform", label="ASCII only")
-        _help("Filter out non-ASCII/unicode characters")
-        dpg.add_checkbox(tag="filter_blank_outputs", label="Filter blanks")
-        _help("Remove tokens that become empty after transforms")
-
-    # --- Help / Readme Window ---
-    readme_pos = (screen_width // 4, screen_height // 4)
-    with dpg.window(tag="readme_window", label="Quick Start Guide",
-                    no_close=False, width=w, height=h, pos=readme_pos, show=True):
-        dpg.add_text("Usage Tips:", color=[120, 200, 255])
-        dpg.add_text("The first time you run CTGS, model downloads may take several minutes. "
-                      "Check the Model Settings window for loading status.", bullet=True)
-        dpg.add_text("Right-click in the text box to see AI-suggested continuations "
-                      "with your constraints applied.", bullet=True)
-        dpg.add_text("F1 refreshes token predictions (same as 'Predict New Tokens' button).", bullet=True)
-        dpg.add_text("F2 inserts a single token directly (same as 'Generate Tokens' with count=1).", bullet=True)
-        dpg.add_text("Use Text Transforms to normalize tokens before filtering. "
-                      "'Full strip' + 'Filter blanks' is recommended as a baseline.", bullet=True)
-        dpg.add_text("The Constraint Strength slider lets you use soft penalties "
-                      "instead of hard bans, preventing vocabulary crippling.", bullet=True)
-        dpg.add_text("Progressive Relaxation automatically expands the candidate pool "
-                      "when constraints are too strict.", bullet=True)
-        dpg.add_text("Backtracking lets multi-token generation recover from dead ends "
-                      "by trying alternative tokens at previous steps.", bullet=True)
-        dpg.add_separator()
-        dpg.add_text("Windows can be rearranged, docked, and tiled. "
-                      "Hover over green (?) icons for context help.")
-        dpg.add_text("Close this window with the X button.")
-
-    # --- Token Analysis Window ---
-    with dpg.window(tag="analysis_window", label="Token Analysis",
-                    no_close=True, width=w * 2, height=h, pos=(0, h * 2)):
-        dpg.add_text("Token Probability Analysis", color=[120, 200, 255])
-        dpg.add_text("Updates automatically when you predict tokens (F1)", color=[180, 180, 180])
-
-        with dpg.group(horizontal=True):
-            dpg.add_input_int(tag="chart_top_n", label="Top N bars",
-                              default_value=30, min_value=5, max_value=500)
-            dpg.add_button(label="Refresh Charts", callback=_refresh_analysis)
+            dpg.add_text(tag="status_text", default_value="Loading model...", color=[120, 200, 120])
 
         dpg.add_separator()
 
-        # --- Bar chart: token probabilities ---
-        with dpg.plot(tag="prob_bar_plot", label="Token Probabilities (green=pass, red=fail)",
-                      height=250, width=-1):
-            dpg.add_plot_legend()
-            dpg.add_plot_axis(dpg.mvXAxis, tag="prob_bar_x", label="Token")
-            dpg.add_plot_axis(dpg.mvYAxis, tag="prob_bar_y", label="Probability")
+        # -- Bottom: tabbed sections --
+        with dpg.tab_bar(tag="main_tabs"):
 
-        dpg.add_separator()
+            # ============ Settings Tab ============
+            with dpg.tab(label="Settings"):
+                with dpg.group(horizontal=True):
+                    # Left column: Model
+                    with dpg.child_window(width=screen_width // 2 - 20, height=-1):
+                        dpg.add_text("Model", color=[120, 200, 255])
+                        dpg.add_input_text(tag="model_name", width=-1, default_value="EleutherAI/pythia-1b",
+                                           label="HuggingFace Model")
+                        with dpg.group(horizontal=True):
+                            dpg.add_combo(items=["32bit", "16bit", "8bit"], tag="precision",
+                                          label="Precision", default_value="32bit", width=120)
+                            dpg.add_button(tag="load_model_btn", label="Load Model", callback=load_model_callback)
+                            dpg.add_loading_indicator(tag="model_loading_indicator", show=False,
+                                                      style=0, radius=2.0, color=(60, 110, 160))
+                        dpg.add_text(tag="model_status", default_value="No model loaded", color=[200, 200, 100])
 
-        # --- Constraint impact: pie chart + breakdown ---
-        dpg.add_text("Constraint Impact", color=[120, 200, 255])
-        with dpg.group(horizontal=True):
-            with dpg.child_window(width=350, height=280):
-                with dpg.plot(tag="constraint_pie_plot", label="Pass vs Fail",
-                              height=250, width=-1, equal_aspects=True,
-                              no_mouse_pos=True):
-                    dpg.add_plot_axis(dpg.mvXAxis, tag="pie_x",
-                                     no_tick_labels=True, no_tick_marks=True, no_gridlines=True)
-                    dpg.add_plot_axis(dpg.mvYAxis, tag="pie_y",
-                                     no_tick_labels=True, no_tick_marks=True, no_gridlines=True)
-            with dpg.child_window(width=-1, height=280):
-                dpg.add_text(tag="constraint_summary_text",
-                             default_value="No data yet", color=[180, 180, 180])
+                        dpg.add_separator()
+                        dpg.add_text("Sampling", color=[120, 200, 255])
+                        dpg.add_slider_float(tag="top_p", label="Top-P",
+                                             default_value=0.0, min_value=0.0, max_value=1.0, format="%.2f")
+                        _help("Top-p (nucleus) sampling. 0 = disabled.")
+                        dpg.add_input_int(tag="top_k", label="Top-K", default_value=0, min_value=0)
+                        _help("Top-K sampling. 0 = disabled.")
+                        dpg.add_slider_float(tag="temperature", label="Temperature",
+                                             default_value=1.0, min_value=0.1, max_value=3.0, format="%.2f")
+                        _help("Lower = more deterministic, higher = more random.")
+                        dpg.add_input_int(tag="num_tokens_to_generate", label="Tokens to generate",
+                                          default_value=20, min_value=1)
+                        dpg.add_checkbox(tag="greedy_decoding", label="Greedy decoding")
+                        _help("Always select the most likely token.")
+
+                    # Right column: Constraint engine + Display
+                    with dpg.child_window(width=-1, height=-1):
+                        dpg.add_text("Constraint Engine", color=[120, 200, 255])
+                        dpg.add_slider_float(tag="constraint_strength", label="Constraint Strength",
+                                             default_value=1.0, min_value=0.0, max_value=1.0, format="%.2f")
+                        _help("1.0 = hard filter. Lower = soft penalties. Prevents vocabulary crippling.")
+                        dpg.add_checkbox(tag="progressive_relaxation", label="Progressive relaxation", default_value=True)
+                        _help("Auto-expands candidate pool when constraints are too strict.")
+                        dpg.add_input_int(tag="max_backtracks", label="Max backtracks",
+                                          default_value=3, min_value=0, max_value=50)
+                        _help("Backtrack this many times on dead ends during generation.")
+
+                        dpg.add_separator()
+                        dpg.add_text("Display & Vocabulary", color=[120, 200, 255])
+                        dpg.add_input_int(tag="max_display_tokens", label="Max tokens to display",
+                                          default_value=200, min_value=0)
+                        _help("Max tokens in popup and table. 0 = unlimited.")
+                        dpg.add_checkbox(tag="show_all_tokens", label="Show all tokens")
+                        _help("Override display limit and show ALL tokens.")
+                        dpg.add_input_int(tag="default_vocab_size", label="Default vocabulary size",
+                                          default_value=500, min_value=0)
+                        _help("Default Top-K when both are 0. Set to 0 for full vocab (slow).")
+
+                        dpg.add_separator()
+                        dpg.add_text("Active Filters:", color=[120, 200, 255])
+                        with dpg.group(tag="active_filters"):
+                            pass
+
+            # ============ Filters Tab ============
+            with dpg.tab(label="Filters"):
+                with dpg.tab_bar(tag="filter_tabs"):
+                    build_all_constraints("filter_tabs")
                 dpg.add_separator()
-                dpg.add_text("Per-Constraint Breakdown:", color=[200, 200, 100])
-                with dpg.group(tag="constraint_breakdown_group"):
-                    pass
+                dpg.add_button(tag="reset_filters_btn", label="Reset All Filters",
+                               callback=turn_filters_off_callback)
 
-        dpg.add_separator()
+            # ============ Transforms Tab ============
+            with dpg.tab(label="Transforms"):
+                dpg.add_text("Text transforms applied to all tokens BEFORE constraint filtering.",
+                             color=[180, 180, 180])
+                dpg.add_text("Using transforms increases the vocabulary that survives filtering.")
+                dpg.add_separator()
+                with dpg.group(horizontal=True):
+                    with dpg.child_window(width=screen_width // 3, height=-1):
+                        dpg.add_text("Case", color=[120, 200, 255])
+                        dpg.add_checkbox(tag="upper_case_transform", label="Uppercase")
+                        dpg.add_checkbox(tag="lower_case_transform", label="Lowercase")
+                        dpg.add_checkbox(tag="capitalize_first_letter_transform", label="Capitalize first letter")
+                    with dpg.child_window(width=screen_width // 3, height=-1):
+                        dpg.add_text("Whitespace", color=[120, 200, 255])
+                        dpg.add_checkbox(tag="replace_spaces", label="Remove spaces")
+                        dpg.add_checkbox(tag="lstrip_transform", label="Left strip")
+                        dpg.add_checkbox(tag="rstrip_transform", label="Right strip")
+                        dpg.add_checkbox(tag="strip_transform", label="Full strip")
+                    with dpg.child_window(width=-1, height=-1):
+                        dpg.add_text("Character Filters", color=[120, 200, 255])
+                        dpg.add_checkbox(tag="alphanumeric_transform", label="Alphanumeric only")
+                        dpg.add_checkbox(tag="alpha_transform", label="Alphabetic only")
+                        dpg.add_checkbox(tag="digit_transform", label="Digits only")
+                        dpg.add_checkbox(tag="ascii_transform", label="ASCII only")
+                        dpg.add_checkbox(tag="filter_blank_outputs", label="Filter blanks")
 
-        # --- Token table ---
-        dpg.add_text("Token Table (click token to insert)", color=[120, 200, 255])
-        dpg.add_input_text(tag="token_search_input", label="Search tokens",
-                           width=300, callback=_refresh_token_table, on_enter=False)
+            # ============ Analysis Tab ============
+            with dpg.tab(label="Analysis"):
+                with dpg.group(horizontal=True):
+                    dpg.add_input_int(tag="chart_top_n", label="Top N bars",
+                                      default_value=30, min_value=5, max_value=500, width=150)
+                    dpg.add_button(label="Refresh Charts", callback=_refresh_analysis)
+                    dpg.add_text(tag="constraint_summary_text",
+                                 default_value="Predict tokens to see analysis", color=[180, 180, 180])
 
-        with dpg.table(tag="token_table", header_row=True,
-                       resizable=True, borders_innerH=True, borders_outerH=True,
-                       borders_innerV=True, borders_outerV=True,
-                       scrollY=True, height=200, row_background=True):
-            dpg.add_table_column(label="Rank", width_fixed=True, init_width_or_weight=60)
-            dpg.add_table_column(label="Token")
-            dpg.add_table_column(label="Probability")
-            dpg.add_table_column(label="Passes", width_fixed=True, init_width_or_weight=70)
+                with dpg.tab_bar(tag="analysis_tabs"):
 
-        dpg.add_separator()
+                    # -- Probability chart sub-tab --
+                    with dpg.tab(label="Probability Chart"):
+                        with dpg.plot(tag="prob_bar_plot",
+                                      label="Token Probabilities (green=pass, red=fail)",
+                                      height=-1, width=-1):
+                            dpg.add_plot_legend()
+                            dpg.add_plot_axis(dpg.mvXAxis, tag="prob_bar_x", label="Token")
+                            dpg.add_plot_axis(dpg.mvYAxis, tag="prob_bar_y", label="Probability")
 
-        # --- Generation history line plot ---
-        dpg.add_text("Generation History (updates after 'Generate Tokens')", color=[120, 200, 255])
-        with dpg.plot(tag="history_plot", label="Token Confidence Over Generation",
-                      height=200, width=-1):
-            dpg.add_plot_legend()
-            dpg.add_plot_axis(dpg.mvXAxis, tag="history_x", label="Step")
-            dpg.add_plot_axis(dpg.mvYAxis, tag="history_y", label="Probability")
+                    # -- Constraint impact sub-tab --
+                    with dpg.tab(label="Constraint Impact"):
+                        with dpg.group(horizontal=True):
+                            with dpg.child_window(width=350, height=-1):
+                                with dpg.plot(tag="constraint_pie_plot", label="Pass vs Fail",
+                                              height=300, width=-1, equal_aspects=True,
+                                              no_mouse_pos=True):
+                                    dpg.add_plot_axis(dpg.mvXAxis, tag="pie_x",
+                                                     no_tick_labels=True, no_tick_marks=True, no_gridlines=True)
+                                    dpg.add_plot_axis(dpg.mvYAxis, tag="pie_y",
+                                                     no_tick_labels=True, no_tick_marks=True, no_gridlines=True)
+                            with dpg.child_window(width=-1, height=-1):
+                                dpg.add_text("Per-Constraint Breakdown:", color=[200, 200, 100])
+                                with dpg.group(tag="constraint_breakdown_group"):
+                                    dpg.add_text("Predict tokens to see breakdown", color=[180, 180, 180])
+
+                    # -- Token table sub-tab --
+                    with dpg.tab(label="Token Table"):
+                        dpg.add_input_text(tag="token_search_input", label="Search",
+                                           width=300, callback=_refresh_token_table, on_enter=False)
+                        with dpg.table(tag="token_table", header_row=True,
+                                       resizable=True, borders_innerH=True, borders_outerH=True,
+                                       borders_innerV=True, borders_outerV=True,
+                                       scrollY=True, height=-1, row_background=True):
+                            dpg.add_table_column(label="Rank", width_fixed=True, init_width_or_weight=60)
+                            dpg.add_table_column(label="Token")
+                            dpg.add_table_column(label="Probability")
+                            dpg.add_table_column(label="Passes", width_fixed=True, init_width_or_weight=70)
+
+                    # -- Generation history sub-tab --
+                    with dpg.tab(label="Generation History"):
+                        with dpg.plot(tag="history_plot", label="Token Confidence Over Generation",
+                                      height=-1, width=-1):
+                            dpg.add_plot_legend()
+                            dpg.add_plot_axis(dpg.mvXAxis, tag="history_x", label="Step")
+                            dpg.add_plot_axis(dpg.mvYAxis, tag="history_y", label="Probability")
+
+            # ============ Help Tab ============
+            with dpg.tab(label="Help"):
+                dpg.add_text("Quick Start Guide", color=[120, 200, 255])
+                dpg.add_separator()
+                dpg.add_text("First run downloads the model + FastText from HuggingFace (may take minutes).", bullet=True)
+                dpg.add_text("Right-click in the text box to see AI-suggested continuations.", bullet=True)
+                dpg.add_text("F1 = Predict tokens (populates right-click menu).", bullet=True)
+                dpg.add_text("F2 = Insert a single token directly.", bullet=True)
+                dpg.add_text("Enable 'Full strip' + 'Filter blanks' in Transforms for best results.", bullet=True)
+                dpg.add_text("Use Constraint Strength < 1.0 for soft penalties instead of hard bans.", bullet=True)
+                dpg.add_text("Progressive Relaxation auto-expands the pool when constraints are strict.", bullet=True)
+                dpg.add_text("Backtracking recovers from dead ends during multi-token generation.", bullet=True)
+                dpg.add_separator()
+                dpg.add_text("Hover over green (?) icons for contextual help on any setting.")
+
+    dpg.set_primary_window("main_window", True)
 
     # --- Key Bindings ---
     with dpg.handler_registry():
