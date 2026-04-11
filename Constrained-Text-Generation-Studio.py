@@ -311,7 +311,9 @@ def get_constrained_tokens(sequence):
                 sorted_indices = nonzero_indices[sorted_order]
                 sorted_probs = nonzero_probs[sorted_order]
 
-                decoded = model_state.tokenizer.batch_decode(sorted_indices)
+                # Decode each token individually — batch_decode with a 1D tensor
+                # treats it as one sequence, so we wrap each ID in its own list
+                decoded = [model_state.tokenizer.decode([tid]) for tid in sorted_indices.tolist()]
 
                 word_list = []
                 for i, raw_text in enumerate(decoded):
