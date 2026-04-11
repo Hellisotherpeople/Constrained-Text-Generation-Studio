@@ -1,51 +1,345 @@
-import random
-import re
-import string
-import time as time
-from collections import Counter
-import numpy as np
+"""
+Constrained Text Generation Studio (CTGS)
+An AI writing assistant for constrained text generation using large language models.
 
+Features progressive relaxation and backtracking to avoid crippling model vocabulary
+when constraints are enabled.
+"""
+
+# ============================================================================
+# Imports
+# ============================================================================
+import os
+import random
+import threading
+import time
+from collections import Counter
+from dataclasses import dataclass, field
+from typing import List
+
+import numpy as np
 import dearpygui.dearpygui as dpg
 import fasttext
+import Levenshtein
 import pronouncing
 import torch
 from huggingface_hub import hf_hub_download
+from pyphonetics import Metaphone
 from scipy import spatial
 from torch.nn import functional as F
-from transformers import (AutoModelForCausalLM, AutoModelForQuestionAnswering,
-                          AutoModelForSeq2SeqLM,
-                          AutoModelForSequenceClassification, AutoTokenizer,
-                          GPT2Tokenizer, LogitsProcessor, LogitsProcessorList,
-                          pipeline, top_k_top_p_filtering)
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from screeninfo import get_monitors
 
-##TODO: Allow more semantic, phonetic, lexical models (Maybe allow specification of fasttext weights, dropdown select some phonetic models)
-##TODO: Loading Bars when loading model, and when generating text
-##TODO: Allow the user to decide to regenerate new predictions with a right click?
-##TODO: Button for loading Masked Language Models, and then displaying the tokenizer masking character, enabling the user to right click and to tab
-##TODO: Proper layout somehow
-##TODO: "novalty generation constraints" like pilish (specify list of word lengths) or pangram/perfect pangram generation
 
-starttime = time.time()
+# ============================================================================
+# State Management
+# ============================================================================
 
-fasttext_model = fasttext.load_model(hf_hub_download("osanseviero/fasttext_embedding", "model.bin"))
+@dataclass
+class ConstraintState:
+    lipogram_banned_list: List[str] = field(default_factory=list)
+    weak_lipogram_banned_list: List[str] = field(default_factory=list)
+    reverse_lipogram_required_list: List[str] = field(default_factory=list)
+    weak_reverse_lipogram_required_list: List[str] = field(default_factory=list)
+    string_in_position_list: List[str] = field(default_factory=list)
+    string_in_position_index_list: List[int] = field(default_factory=list)
+    starts_with_string: str = ""
+    ends_with_string: str = ""
+    phonetic_matching_string: str = ""
+    semantic_matching_string: str = ""
+    semantic_distance_threshold: float = 0.0
+    string_edit_string: str = ""
+    string_edit_distance_threshold: int = 0
+    syllable_number: int = 0
+    meter_string: str = ""
+    rhyme_string: str = ""
+    constrained_length: int = 0
+    constrained_gt_length: int = 0
+    constrained_lt_length: int = 0
+    palindrome_enabled: bool = False
+    anagram_string: str = ""
+    partial_anagram_string: str = ""
+    isogram_count: int = 0
+    reverse_isogram_count: int = 0
+
+    def has_active_constraints(self):
+        return (
+            bool(self.lipogram_banned_list) or bool(self.weak_lipogram_banned_list) or
+            bool(self.reverse_lipogram_required_list) or bool(self.weak_reverse_lipogram_required_list) or
+            bool(self.string_in_position_list) or bool(self.starts_with_string) or
+            bool(self.ends_with_string) or self.constrained_length > 0 or
+            self.constrained_gt_length > 0 or self.constrained_lt_length > 0 or
+            self.palindrome_enabled or bool(self.phonetic_matching_string) or
+            bool(self.semantic_matching_string) or bool(self.anagram_string) or
+            bool(self.partial_anagram_string) or bool(self.rhyme_string) or
+            bool(self.meter_string) or bool(self.string_edit_string) or
+            self.syllable_number > 0 or self.isogram_count > 0 or self.reverse_isogram_count > 0
+        )
+
+    def reset(self):
+        self.__init__()
 
 
-tokenizer = ""
-model = ""
+@dataclass
+class ModelState:
+    tokenizer: object = None
+    model: object = None
+    loading: bool = False
+    name: str = ""
 
-def add_and_load_image(image_path, parent=None):
-    width, height, channels, data = dpg.load_image(image_path)
 
-    with dpg.texture_registry() as reg_id:
-        texture_id = dpg.add_static_texture(width, height, data, parent=reg_id)
+constraints = ConstraintState()
+model_state = ModelState()
+phonetic_encoder = Metaphone()
+fasttext_model = None
+_dynamic_tags = []  # tracks filter status tags for cleanup on reset
+_generation_thread = None
 
-    if parent is None:
-        return dpg.add_image(texture_id)
-    else:
-        return dpg.add_image(texture_id, parent=parent)
+
+# ============================================================================
+# Constraint Filter Logic
+# ============================================================================
+
+def passes_all_constraints(word, cs):
+    """Check if (text, probability) tuple passes all active constraints. Early-return on failure."""
+    text = word[0]
+
+    if cs.lipogram_banned_list:
+        if not all(c not in text for c in cs.lipogram_banned_list):
+            return False
+    if cs.weak_lipogram_banned_list:
+        if not any(c not in cs.weak_lipogram_banned_list for c in text):
+            return False
+    if cs.reverse_lipogram_required_list:
+        if not all(c in text for c in cs.reverse_lipogram_required_list):
+            return False
+    if cs.weak_reverse_lipogram_required_list:
+        if not any(c in cs.weak_reverse_lipogram_required_list for c in text):
+            return False
+    if cs.string_in_position_list:
+        for idx, ch in enumerate(cs.string_in_position_list):
+            try:
+                if text[cs.string_in_position_index_list[idx]] != ch:
+                    return False
+            except (IndexError, TypeError):
+                return False
+    if cs.starts_with_string and not text.startswith(cs.starts_with_string):
+        return False
+    if cs.ends_with_string and not text.endswith(cs.ends_with_string):
+        return False
+    if cs.constrained_length > 0 and len(text) != cs.constrained_length:
+        return False
+    if cs.constrained_gt_length > 0 and len(text) <= cs.constrained_gt_length:
+        return False
+    if cs.constrained_lt_length > 0 and len(text) >= cs.constrained_lt_length:
+        return False
+    if cs.palindrome_enabled and text != text[::-1]:
+        return False
+    if cs.phonetic_matching_string:
+        try:
+            if phonetic_encoder.phonetics(text) != phonetic_encoder.phonetics(cs.phonetic_matching_string):
+                return False
+        except Exception:
+            return False
+    if cs.semantic_matching_string and fasttext_model is not None:
+        try:
+            v1 = fasttext_model.get_word_vector(text)
+            v2 = fasttext_model.get_word_vector(cs.semantic_matching_string)
+            sim = 1 - spatial.distance.cosine(v1, v2)
+            if sim < cs.semantic_distance_threshold:
+                return False
+        except Exception:
+            return False
+    if cs.anagram_string and Counter(text) != Counter(cs.anagram_string):
+        return False
+    if cs.partial_anagram_string and (Counter(text) - Counter(cs.partial_anagram_string)):
+        return False
+    if cs.rhyme_string and text not in pronouncing.rhymes(cs.rhyme_string):
+        return False
+    if cs.meter_string:
+        ref_phones = pronouncing.phones_for_word(cs.meter_string)
+        word_phones = pronouncing.phones_for_word(text)
+        if not ref_phones or not word_phones:
+            return False
+        if pronouncing.stresses(word_phones[0]) != pronouncing.stresses(ref_phones[0]):
+            return False
+    if cs.string_edit_string:
+        if Levenshtein.distance(text, cs.string_edit_string) > cs.string_edit_distance_threshold:
+            return False
+    if cs.syllable_number > 0:
+        phones = pronouncing.phones_for_word(text)
+        if not phones or pronouncing.syllable_count(phones[0]) != cs.syllable_number:
+            return False
+    if cs.isogram_count > 0:
+        for ch in set(text):
+            if text.count(ch) > cs.isogram_count:
+                return False
+    if cs.reverse_isogram_count > 0:
+        for ch in set(text):
+            if text.count(ch) < cs.reverse_isogram_count:
+                return False
+
+    return True
+
+
+# ============================================================================
+# Top-K / Top-P Filtering (replaces deprecated transformers function)
+# ============================================================================
+
+def apply_top_k_top_p(logits, top_k=0, top_p=0.0):
+    """Filter logits using top-k and/or top-p (nucleus) sampling."""
+    logits = logits.clone()
+    if top_k > 0:
+        top_k = min(top_k, logits.size(-1))
+        threshold = torch.topk(logits, top_k)[0][..., -1, None]
+        logits[logits < threshold] = float('-inf')
+    if 0.0 < top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+        sorted_mask = cumulative_probs > top_p
+        sorted_mask[..., 1:] = sorted_mask[..., :-1].clone()
+        sorted_mask[..., 0] = False
+        indices_to_remove = sorted_mask.scatter(dim=-1, index=sorted_indices, src=sorted_mask)
+        logits[indices_to_remove] = float('-inf')
+    return logits
+
+
+# ============================================================================
+# Text Transforms
+# ============================================================================
+
+def apply_text_transforms(text):
+    """Apply all active text transforms to a decoded token string."""
+    if dpg.get_value("upper_case_transform"):
+        text = text.upper()
+    if dpg.get_value("lower_case_transform"):
+        text = text.lower()
+    if dpg.get_value("replace_spaces"):
+        text = text.replace(' ', '')
+    if dpg.get_value("lstrip_transform"):
+        text = text.lstrip()
+    if dpg.get_value("rstrip_transform"):
+        text = text.rstrip()
+    if dpg.get_value("strip_transform"):
+        text = text.strip()
+    if dpg.get_value("capitalize_first_letter_transform"):
+        text = text.capitalize()
+    if dpg.get_value("alphanumeric_transform"):
+        text = ''.join(ch for ch in text if ch.isalnum())
+    if dpg.get_value("alpha_transform"):
+        text = ''.join(ch for ch in text if ch.isalpha())
+    if dpg.get_value("digit_transform"):
+        text = ''.join(ch for ch in text if ch.isdigit())
+    if dpg.get_value("ascii_transform"):
+        text = ''.join(ch for ch in text if ch.isascii())
+    return text
+
+
+# ============================================================================
+# Token Generation Engine (progressive relaxation + constraint filtering)
+# ============================================================================
+
+def _relaxation_levels(base_k, base_p):
+    """Yield progressively relaxed (k, p) pairs to avoid empty results."""
+    yield (base_k, base_p)
+    if base_k > 0:
+        yield (base_k * 2, base_p)
+        yield (base_k * 4, base_p)
+    if base_p > 0:
+        yield (0, min(base_p * 1.5, 0.99))
+        yield (0, min(base_p * 2.0, 0.99))
+    yield (0, 0.0)  # full vocabulary
+
+
+def get_constrained_tokens(sequence):
+    """Generate candidate tokens with progressive relaxation to prevent vocabulary crippling.
+
+    Instead of applying top-k/top-p first and hoping enough tokens survive constraint
+    filtering, this function progressively expands the candidate pool when too few
+    tokens pass. It also supports soft constraints (penalty-based) via the constraint
+    strength slider.
+    """
+    if model_state.model is None or model_state.tokenizer is None:
+        return []
+
+    try:
+        with torch.no_grad():
+            input_ids = model_state.tokenizer.encode(sequence, return_tensors="pt")
+            try:
+                device = next(model_state.model.parameters()).device
+                input_ids = input_ids.to(device)
+            except StopIteration:
+                pass
+
+            outputs = model_state.model(input_ids)
+            raw_logits = outputs.logits[:, -1, :]
+
+            temperature = dpg.get_value("temperature")
+            if temperature > 0 and temperature != 1.0:
+                raw_logits = raw_logits / temperature
+
+            top_p = dpg.get_value("top_p")
+            top_k = dpg.get_value("top_k")
+            strength = dpg.get_value("constraint_strength")
+            use_relaxation = dpg.get_value("progressive_relaxation")
+            has_constraints = constraints.has_active_constraints()
+
+            if use_relaxation and has_constraints:
+                levels = list(_relaxation_levels(top_k, top_p))
+            else:
+                levels = [(top_k, top_p)]
+
+            for eff_k, eff_p in levels:
+                logits = apply_top_k_top_p(raw_logits, top_k=eff_k, top_p=eff_p)
+                probs = F.softmax(logits.float(), dim=-1).sort(descending=True)
+
+                word_list = []
+                decoded = model_state.tokenizer.batch_decode(probs[1][0])
+                filter_blanks = dpg.get_value("filter_blank_outputs")
+
+                for i, raw_text in enumerate(decoded):
+                    prob = probs[0][0][i].item()
+                    if prob <= 0:
+                        break  # remaining tokens have zero probability
+
+                    text = apply_text_transforms(raw_text)
+                    if filter_blanks and text == "":
+                        continue
+                    word_list.append((text, prob))
+
+                if not has_constraints:
+                    return word_list
+
+                # Apply constraints with strength control
+                if strength >= 1.0:
+                    filtered = [w for w in word_list if passes_all_constraints(w, constraints)]
+                elif strength <= 0.0:
+                    filtered = word_list
+                else:
+                    passing = []
+                    failing = []
+                    for w in word_list:
+                        (passing if passes_all_constraints(w, constraints) else failing).append(w)
+                    penalty_factor = 1.0 - strength
+                    filtered = passing + [(t, p * penalty_factor) for t, p in failing]
+                    filtered.sort(key=lambda x: x[1], reverse=True)
+
+                if filtered:
+                    return filtered
+
+            return []
+
+    except Exception as e:
+        dpg.set_value("status_text", f"Generation error: {e}")
+        return []
+
+
+# ============================================================================
+# UI Helper Functions
+# ============================================================================
 
 def _help(message):
+    """Add a green (?) tooltip next to the last-added DPG item."""
     last_item = dpg.last_item()
     group = dpg.add_group(horizontal=True)
     dpg.move_item(last_item, parent=group)
@@ -54,1113 +348,677 @@ def _help(message):
     with dpg.tooltip(t):
         dpg.add_text(message)
 
-def load_model(the_name):
-    global tokenizer
-    global model
-    if the_name == "load_model":
-        model_name = dpg.get_value("model_name")
+
+def add_and_load_image(image_path, parent=None):
+    width, height, channels, data = dpg.load_image(image_path)
+    with dpg.texture_registry() as reg_id:
+        texture_id = dpg.add_static_texture(width, height, data, parent=reg_id)
+    if parent is None:
+        return dpg.add_image(texture_id)
+    return dpg.add_image(texture_id, parent=parent)
+
+
+# ============================================================================
+# UI Callbacks
+# ============================================================================
+
+def refresh_token_popup(*args):
+    """Refresh the right-click popup with new constrained token predictions."""
+    if model_state.model is None:
+        dpg.set_value("status_text", "No model loaded. Load a model first.")
+        return
+
+    dpg.set_value("status_text", "Predicting tokens...")
+    candidates = get_constrained_tokens(dpg.get_value("input_string"))
+
+    dpg.delete_item("token_popup", children_only=True)
+    dpg.add_text("Suggested Continuations", parent="token_popup")
+    dpg.add_separator(parent="token_popup")
+
+    if candidates:
+        for text, prob in candidates[:200]:
+            dpg.add_selectable(
+                label=f"{text}  ({prob:.2%})",
+                user_data=text,
+                callback=_add_word_callback,
+                parent="token_popup"
+            )
+        dpg.set_value("status_text", f"Ready - {len(candidates)} candidates")
     else:
-        model_name = the_name
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    if dpg.get_value("percision") == "8bit":
-        model = AutoModelForCausalLM.from_pretrained(model_name, device_map='auto', load_in_8bit=True)
-    elif dpg.get_value("percision") == "16bit":
-        model = AutoModelForCausalLM.from_pretrained(model_name, device_map='auto', load_in_8bit=False, torch_dtype=torch.float16)
-    else:
-        model = AutoModelForCausalLM.from_pretrained(model_name, device_map='auto', load_in_8bit=False)
-    if torch.cuda.is_available():
-        loaded_model_string = model_name + " Loaded Succesfully onto the GPU" + " with " + dpg.get_value("percision") + " percision"
-        dpg.add_text(parent = "load_model_window", default_value = loaded_model_string)
-    else:
-        loaded_model_string = model_name + " Loaded Succesfully onto the CPU" + " with " + dpg.get_value("percision") + " percision"
-        dpg.add_text(parent = "load_model_window", default_value = loaded_model_string)
+        dpg.add_text("No results with current constraints", parent="token_popup")
+        dpg.set_value("status_text", "No tokens match current constraints")
 
 
-
-########--------------------------------------------------------------#### Filters ########--------------------------------------------------------------####
-
-def all_letters_included(word, string_list):
-    return all(c in word[0] for c in string_list)
-
-
-def any_letters_included(word, string_list):
-    return any(c in string_list for c in word[0])
-
-def all_letters_not_included(word, string_list):
-    #any(c in letters for c in word)
-    return all(c not in word[0] for c in string_list)
-
-def any_letters_not_included(word, string_list):
-    ## "e.g. not words with both B and T in them!"
-    return any(c not in string_list for c in word[0])
-
-def equal_to_length(word, word_length):
-    return len(word[0]) == word_length
+def _add_word_callback(sender, app_data, user_data):
+    """Append clicked token to the input text."""
+    current = dpg.get_value("input_string")
+    dpg.set_value("input_string", current + str(user_data))
+    refresh_token_popup()
 
 
-def greater_than_length(word, word_length):
-    return len(word[0]) > word_length
+def tab_key_generate_callback(*args):
+    """F2: Insert a single token directly into the text."""
+    if model_state.model is None:
+        dpg.set_value("status_text", "No model loaded.")
+        return
 
-def less_than_length(word, word_length):
-    return len(word[0]) < word_length
+    text = dpg.get_value("input_string")
+    candidates = get_constrained_tokens(text)
 
-def ends_with(word, ending_string,  start = None, end = None):
-    return word[0].endswith(ending_string, start, end)
+    if not candidates:
+        dpg.set_value("status_text", "No tokens match current constraints")
+        return
 
-def starts_with(word, starting_string, start = None, end = None):
-    return word[0].startswith(starting_string, start, end)
-
-def string_in_position(word, a_string_list, position_index_list):
-    for idx, string in enumerate(a_string_list):
-        try:
-            if word[0][position_index_list[idx]] != string:
-                return False
-        except:
-            return False
-    return True
-
-def phonetic_matching(word, phonetic_matching_string):
-    if pe.encode(word[0]) == pe.encode(phonetic_matching_string):
-        return True
-    else:
-        return False
-
-def string_edit(word, string_edit_string, string_edit_threshold):
-    if cmp.dist_abs(word[0], string_edit_string) <= string_edit_threshold:
-        return True
-    else:
-        return False
-
-
-
-def semantic_matching(word, semantic_string, semantic_threshold):
-    word_word_vector = fasttext_model.get_word_vector(word[0])
-    semantic_string_vector = fasttext_model.get_word_vector(semantic_string)
-    similarity = 1 - spatial.distance.cosine(word_word_vector, semantic_string_vector)
-    if similarity >= semantic_threshold:
-        return True
-    else: 
-        return False
-
-
-def rhyme(word, rhyme_string):
-    the_string = word[0]
-    if the_string in pronouncing.rhymes(rhyme_string):
-        return True
-    else:
-        return False
-
-
-def meter(word, meter_string):
-    the_string = word[0]
-    phones_list = pronouncing.phones_for_word(meter_string)
-    meter_string_stress = pronouncing.stresses(phones_list[0])
-    word_phones_list = pronouncing.phones_for_word(the_string)
-    if len(word_phones_list) > 0:
-        word_stress = pronouncing.stresses(word_phones_list[0])
-        if word_stress == meter_string_stress:
-            return True
-        else:
-            return False
-    else:
-        return False
-
-def syllable(word, syllable_number):
-    the_string = word[0]
-    phones_list = pronouncing.phones_for_word(the_string)
-    if len(phones_list) > 0:
-        syllable_count = pronouncing.syllable_count(phones_list[0])
-        if syllable_count == syllable_number:
-            return True
-        else:
-            return False
-    else:
-        return False
-
-
-
-
-def palindrome(word):
-    the_string = word[0]
-    if the_string == the_string[::-1]:
-        return True
-    else:
-        return False
-
-def partial_anagram(word, a_string):
-    ###Like a full anagram but allows anagramic substrings
-    if Counter(word[0]) - Counter(a_string):
-         return False
-    return True
-
-def full_anagram(word, a_string):
-    ### Only true anagrams!
-    if Counter(word[0]) == Counter(a_string):
-        return True
-    else:
-        return False
-
-def isogram(word, count = 1):
-    ##Allow user to optionally specify list of characters to isolate
-    for char in word[0]:
-        if word[0].count(char) > count:
-            return False
-    return True
-
-def reverse_isogram(word, count = 1):
-    ##Allow user to optionally specify list of characters to isolate
-    for char in word[0]:
-        if word[0].count(char) < count:
-            return False
-    return True
-
-
-"""
-
-Ideas 
-
-1. Longest repeating and non overlapping substring in a string
-2. List of strings to consume from, like a pangram but you specify the alphabet
-3. Edit Distance of strings, user supplies string and max distance and it returns strings with that distance. I think this is fast enough to calculate for this to work!
-
-Leetcode stuff like this
-
-Find longest palindroming substring
-def countSubstrings(self, s: str) -> int:
-        @cache
-        def isPalindrome(i, j):
-            return i >= j or s[i] == s[j] and isPalindrome(i + 1, j - 1)
-        return sum(isPalindrome(i, j) for i in range(len(s)) for j in range(i, len(s)))
-
-"""
-
-########--------------------------------------------------------------####          ########--------------------------------------------------------------####
-
-
-lipogram_naughty_word_list = []
-weak_lipogram_naughty_word_list = []
-reverse_lipogram_nice_word_list = []
-weak_reverse_lipogram_nice_word_list = []
-string_in_positon_list = []
-string_in_positon_index_list = []
-starts_with_string = ""
-ends_with_string = ""
-phonetic_matching_string = ""
-semantic_matching_string = ""
-semantic_distance_threshold = 0.0
-string_edit_string = ""
-string_edit_distnace_threhold = 0
-syllable_number = 0
-meter_string = ""
-rhyme_string = ""
-constrained_length = 0
-constrained_gt_length = 0
-constrained_lt_length = 0
-palindrome_enabled = False
-anagram_string = ""
-partial_anagram_string = ""
-isogram_count = 0
-reverse_isogram_count = 0
-
-
-
-def get_next_word_without_e(sequence):
-    all_letters_filtered_list = []
-    with torch.no_grad():
-        input_ids = tokenizer.encode(sequence, return_tensors="pt")
-        # get logits of last hidden state
-        next_token_candidates_logits = model(input_ids)[0][:, -1, :]
-        temperature = dpg.get_value("temperature")
-        if temperature != 1.0:
-            next_token_candidates_logits = next_token_candidates_logits / temperature
-        # filter
-        top_p = dpg.get_value("top_p")
-        top_k = dpg.get_value("top_k")
-        if (top_p > 0 and top_k > 0):
-            filtered_next_token_candidates_logits = top_k_top_p_filtering(next_token_candidates_logits, top_k=top_k, top_p=top_p)
-        elif top_p > 0:
-            filtered_next_token_candidates_logits = top_k_top_p_filtering(next_token_candidates_logits, top_p=top_p)
-        elif top_k > 0:
-            filtered_next_token_candidates_logits = top_k_top_p_filtering(next_token_candidates_logits, top_k=top_k)
-        else:
-            filtered_next_token_candidates_logits = next_token_candidates_logits
-        # sample and get a probability distribution
-        probs = F.softmax(filtered_next_token_candidates_logits.float(), dim=-1).sort(descending = True)
-        word_list = []
-        resulting_strings = tokenizer.batch_decode(probs[1][0])
-        for iter, resulting_string in enumerate(resulting_strings):
-            probability = probs[0][0][iter].item()
-            if dpg.get_value("upper_case_transform"):
-                resulting_string = resulting_string.upper()
-            if dpg.get_value("lower_case_transform"):
-                resulting_string = resulting_string.lower()
-            if dpg.get_value("replace_spaces"):
-                resulting_string = resulting_string.replace(' ', '')
-            if dpg.get_value("lstrip_transform"):
-                resulting_string = resulting_string.lstrip()
-            if dpg.get_value("rstrip_transform"):
-                resulting_string = resulting_string.rstrip()
-            if dpg.get_value("strip_transform"):
-                resulting_string = resulting_string.strip()
-            if dpg.get_value("capitalize_first_letter_transform"):
-                resulting_string = resulting_string.capitalize()
-            if dpg.get_value("alpha_numaric_transform"):
-                resulting_string = ''.join(ch for ch in resulting_string if ch.isalnum())
-            if dpg.get_value("alpha_transform"):
-                resulting_string = ''.join(ch for ch in resulting_string if ch.isalpha())
-            if dpg.get_value("digit_transform"):
-                resulting_string = ''.join(ch for ch in resulting_string if ch.isdigit())
-            if dpg.get_value("ascii_transform"):
-                resulting_string = ''.join(ch for ch in resulting_string if ch.isascii())
-            if dpg.get_value("filter_blank_outputs"):
-                if resulting_string == "":
-                    continue
-            word_list.append((resulting_string, probability))
-
-        #all_letters_filtered_list = [word for word in word_list if all_letters_not_included(word=word, string_list = lipogram_naughty_word_list)]
-
-        all_letters_filtered_list = [
-        word for word in word_list
-        if (
-            (not lipogram_naughty_word_list or all_letters_not_included(word=word, string_list=lipogram_naughty_word_list)) and
-            (not weak_lipogram_naughty_word_list or any_letters_not_included(word=word, string_list=weak_lipogram_naughty_word_list)) and
-            (not reverse_lipogram_nice_word_list or all_letters_included(word=word, string_list=reverse_lipogram_nice_word_list)) and
-            (not weak_reverse_lipogram_nice_word_list or any_letters_included(word=word, string_list=weak_reverse_lipogram_nice_word_list)) and
-            (not string_in_positon_list or string_in_position(word=word, a_string_list=string_in_positon_list, position_index_list=string_in_positon_index_list)) and
-            (not starts_with_string or starts_with(word=word, starting_string=starts_with_string)) and
-            (not ends_with_string or ends_with(word=word, ending_string=ends_with_string)) and
-            (not constrained_length or equal_to_length(word=word, word_length=constrained_length)) and
-            (not constrained_gt_length or greater_than_length(word=word, word_length=constrained_gt_length)) and
-            (not constrained_lt_length or less_than_length(word=word, word_length=constrained_lt_length)) and
-            (not palindrome_enabled or palindrome(word=word)) and
-            (not phonetic_matching_string or phonetic_matching(word=word, phonetic_matching_string=phonetic_matching_string)) and
-            (not semantic_matching_string or semantic_matching(word=word, semantic_string=semantic_matching_string, semantic_threshold=semantic_distance_threshold)) and
-            (not anagram_string or full_anagram(word=word, a_string=anagram_string)) and
-            (not partial_anagram_string or partial_anagram(word=word, a_string=partial_anagram_string)) and
-            (not rhyme_string or rhyme(word=word, rhyme_string=rhyme_string)) and
-            (not meter_string or meter(word=word, meter_string=meter_string)) and
-            (not string_edit_string or string_edit(word=word, string_edit_string=string_edit_string, string_edit_threshold=string_edit_distnace_threhold)) and
-            (not syllable_number or syllable(word=word, syllable_number=syllable_number)) and
-            (isogram_count < 1 or isogram(word=word, count=isogram_count)) and
-            (reverse_isogram_count < 1 or reverse_isogram(word=word, count=reverse_isogram_count))
-        )
-    ]
-            
-
-        #all_letters_filtered_list = [word for word in word_list if all_letters_not_included(word=word, starting_string= "EN")]
-        #list(filter(all_letters_included, word_list))
-        #print(probs)
-        #print(all_letters_filtered_list[0:50])
-        #print(probs)
-
-
-                    
-        return all_letters_filtered_list
-
-
-def tab_key_generate_tokens_callback():
-    string_input = dpg.get_value("input_string")
-    generated_output = get_next_word_without_e(string_input)
     if dpg.get_value("greedy_decoding"):
-        returned_word = generated_output[0][0]
+        chosen = candidates[0][0]
     else:
-        probability_weights = tuple(zip(*generated_output))[1]
-        returned_word = random.choices(generated_output, weights = probability_weights, k = 1)[0][0]    
-    string_input += returned_word
-    dpg.set_value("input_string", string_input)
+        words, probs = zip(*candidates)
+        p = np.array(probs)
+        p = p / p.sum()
+        chosen = words[np.random.choice(len(words), p=p)]
 
-def generate_tokens_callback():
-    number_of_tokens = dpg.get_value("num_tokens_to_generate")
-    greedy_decoding = dpg.get_value("greedy_decoding")
-    string_input = dpg.get_value("input_string")
+    dpg.set_value("input_string", text + chosen)
 
-    for _ in range(number_of_tokens):
-        generated_output = get_next_word_without_e(string_input)
 
-        if greedy_decoding:
-            returned_word = generated_output[0][0]
+def generate_tokens_callback(*args):
+    """Generate multiple tokens with backtracking on dead ends."""
+    global _generation_thread
+    if model_state.model is None:
+        dpg.set_value("status_text", "No model loaded.")
+        return
+    if _generation_thread and _generation_thread.is_alive():
+        dpg.set_value("status_text", "Generation already in progress...")
+        return
+
+    _generation_thread = threading.Thread(target=_generate_tokens_worker, daemon=True)
+    _generation_thread.start()
+
+
+def _generate_tokens_worker():
+    """Worker thread for multi-token generation with backtracking."""
+    num_tokens = dpg.get_value("num_tokens_to_generate")
+    max_bt = dpg.get_value("max_backtracks")
+    greedy = dpg.get_value("greedy_decoding")
+    text = dpg.get_value("input_string")
+
+    history = []
+    backtracks_used = 0
+    tokens_generated = 0
+
+    while tokens_generated < num_tokens:
+        candidates = get_constrained_tokens(text)
+
+        if not candidates:
+            # Backtrack: try next-best alternative from a previous step
+            if backtracks_used < max_bt and history:
+                prev_text, alts = history.pop()
+                if alts:
+                    chosen_text = alts.pop(0)[0]
+                    text = prev_text + chosen_text
+                    if alts:
+                        history.append((prev_text, alts))
+                    backtracks_used += 1
+                    tokens_generated += 1
+                    dpg.set_value("input_string", text)
+                    dpg.set_value("status_text", f"Backtracked! Token {tokens_generated}/{num_tokens}")
+                    continue
+            dpg.set_value("status_text", f"Dead end after {tokens_generated} tokens")
+            return
+
+        if greedy:
+            chosen = candidates[0]
+            remaining = candidates[1:6]
         else:
-            words, probabilities = zip(*generated_output)
-            probabilities_normalized = np.array(probabilities) / np.sum(probabilities)
-            returned_word = np.random.choice(words, p=probabilities_normalized)
+            words, probs = zip(*candidates)
+            p = np.array(probs)
+            p = p / p.sum()
+            idx = np.random.choice(len(candidates), p=p)
+            chosen = candidates[idx]
+            remaining = [c for j, c in enumerate(candidates) if j != idx][:5]
 
-        string_input += returned_word
-        dpg.set_value("input_string", string_input)
+        history.append((text, remaining))
+        text += chosen[0]
+        tokens_generated += 1
+        dpg.set_value("input_string", text)
+        dpg.set_value("status_text", f"Generated {tokens_generated}/{num_tokens} tokens")
 
-def add_generated_word_callback(sender, app_data, user_data):
-    current_value = dpg.get_value("input_string")
-    new_string = current_value + str(user_data)
-    dpg.set_value("input_string", new_string)
-    edit_string_callback()
+    dpg.set_value("status_text", f"Done! Generated {num_tokens} tokens")
 
-def edit_string_callback():
-    string_input = dpg.get_value("input_string")
-    returned_words = get_next_word_without_e(string_input)
-    #print(returned_words)
-    with dpg.popup(parent = "input_string"):
-        dpg.add_text("Options")
+
+def load_model_callback(sender=None, app_data=None, user_data=None, model_name_override=None):
+    """Load a HuggingFace model in a background thread."""
+    if model_state.loading:
+        dpg.set_value("model_status", "Already loading a model...")
+        return
+
+    model_name = model_name_override if model_name_override else dpg.get_value("model_name")
+    model_state.loading = True
+    dpg.set_value("model_status", f"Loading {model_name}...")
+    dpg.configure_item("load_model_btn", enabled=False)
+    dpg.show_item("model_loading_indicator")
+
+    def _load():
+        try:
+            precision = dpg.get_value("precision")
+            model_state.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            kwargs = {"device_map": "auto"}
+            if precision == "8bit":
+                kwargs["load_in_8bit"] = True
+            elif precision == "16bit":
+                kwargs["torch_dtype"] = torch.float16
+            model_state.model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+            model_state.name = model_name
+
+            device = "GPU" if torch.cuda.is_available() else "CPU"
+            dpg.set_value("model_status", f"{model_name} loaded on {device} ({precision})")
+        except Exception as e:
+            dpg.set_value("model_status", f"Error: {e}")
+        finally:
+            model_state.loading = False
+            dpg.configure_item("load_model_btn", enabled=True)
+            dpg.hide_item("model_loading_indicator")
+
+    threading.Thread(target=_load, daemon=True).start()
+
+
+def turn_filters_off_callback(*args):
+    """Reset all constraints and clean up status UI."""
+    constraints.reset()
+    for tag in _dynamic_tags:
+        if dpg.does_item_exist(tag):
+            dpg.delete_item(tag)
+    dpg.set_value("status_text", "All filters reset")
+
+
+# ============================================================================
+# Constraint UI Builder
+# ============================================================================
+
+def _add_constraint(parent, cid, label, help_text, build_options_fn, height=100, toggle_attr=None):
+    """Add a constraint checkbox + collapsible options section.
+
+    build_options_fn(options_tag): called to populate the options child window.
+    toggle_attr: if set, toggling the checkbox directly sets this ConstraintState attribute.
+    """
+    options_tag = f"{cid}_options"
+    check_tag = f"{cid}_check"
+
+    def toggle(s, a, u):
+        dpg.show_item(options_tag) if a else dpg.hide_item(options_tag)
+        if toggle_attr:
+            setattr(constraints, toggle_attr, a)
+
+    dpg.add_checkbox(tag=check_tag, label=label, callback=toggle, parent=parent)
+    _help(help_text)
+
+    with dpg.child_window(tag=options_tag, show=False, height=height, width=-1, parent=parent):
+        build_options_fn(options_tag)
+
+
+def _make_apply_callback(cid, label, load_fn):
+    """Create an 'Apply' callback that sets constraint state and updates filter display."""
+    applied_tag = f"{cid}_applied"
+    filter_tag = f"{cid}_filter"
+    _dynamic_tags.extend([applied_tag, filter_tag])
+
+    def cb(*args):
+        display = load_fn()
+        if dpg.does_item_exist(applied_tag):
+            dpg.set_value(filter_tag, f"{label}: {display}")
+        else:
+            dpg.add_text(tag=applied_tag, default_value=f"{label} applied!",
+                         parent=f"{cid}_options")
+            dpg.add_text(tag=filter_tag, default_value=f"{label}: {display}",
+                         parent="active_filters")
+        refresh_token_popup()
+
+    return cb
+
+
+def build_all_constraints(tab_bar_tag):
+    """Build the complete constraint UI organized into tabs."""
+
+    # --- Lexical Tab ---
+    with dpg.tab(label="Lexical", parent=tab_bar_tag) as lexical:
+
+        def _lipogram_opts(p):
+            dpg.add_text("Add banned letters or strings separated by spaces", parent=p)
+            dpg.add_input_text(tag="lipogram_input", label="Banned Strings", width=-100, parent=p)
+            def load():
+                raw = dpg.get_value("lipogram_input")
+                constraints.lipogram_banned_list = raw.split() if raw.strip() else []
+                return " ".join(constraints.lipogram_banned_list)
+            dpg.add_button(label="Apply", callback=_make_apply_callback("lipogram", "All Strings Banned", load), parent=p)
+        _add_constraint(lexical, "lipogram", "All Strings Banned",
+                        "A lipogram avoids particular letters or strings.", _lipogram_opts)
+
+        def _weak_lipogram_opts(p):
+            dpg.add_text("Add banned letters or strings separated by spaces", parent=p)
+            dpg.add_input_text(tag="weak_lipogram_input", label="Banned Strings", width=-100, parent=p)
+            def load():
+                raw = dpg.get_value("weak_lipogram_input")
+                constraints.weak_lipogram_banned_list = raw.split() if raw.strip() else []
+                return " ".join(constraints.weak_lipogram_banned_list)
+            dpg.add_button(label="Apply", callback=_make_apply_callback("weak_lipogram", "Any Strings Banned", load), parent=p)
+        _add_constraint(lexical, "weak_lipogram", "Any Strings Banned",
+                        "A weak lipogram avoids at least one of the specified letters/strings.", _weak_lipogram_opts)
+
+        def _rev_lipogram_opts(p):
+            dpg.add_text("Add required letters or strings separated by spaces", parent=p)
+            dpg.add_input_text(tag="rev_lipogram_input", label="Required Strings", width=-100, parent=p)
+            def load():
+                raw = dpg.get_value("rev_lipogram_input")
+                constraints.reverse_lipogram_required_list = raw.split() if raw.strip() else []
+                return " ".join(constraints.reverse_lipogram_required_list)
+            dpg.add_button(label="Apply", callback=_make_apply_callback("rev_lipogram", "All Strings Required", load), parent=p)
+        _add_constraint(lexical, "rev_lipogram", "All Strings Required",
+                        "A reverse lipogram forces particular letters or strings to appear.", _rev_lipogram_opts)
+
+        def _weak_rev_opts(p):
+            dpg.add_text("Add required letters or strings separated by spaces", parent=p)
+            dpg.add_input_text(tag="weak_rev_input", label="Required Strings", width=-100, parent=p)
+            def load():
+                raw = dpg.get_value("weak_rev_input")
+                constraints.weak_reverse_lipogram_required_list = raw.split() if raw.strip() else []
+                return " ".join(constraints.weak_reverse_lipogram_required_list)
+            dpg.add_button(label="Apply", callback=_make_apply_callback("weak_rev", "Any Strings Required", load), parent=p)
+        _add_constraint(lexical, "weak_rev", "Any Strings Required",
+                        "Forces at least one of the specified letters/strings to appear.", _weak_rev_opts)
+
+        def _str_pos_opts(p):
+            dpg.add_text("Characters separated by spaces", parent=p)
+            dpg.add_input_text(tag="pos_chars_input", label="Characters", width=-100, parent=p)
+            dpg.add_text("Corresponding position indexes separated by spaces", parent=p)
+            dpg.add_input_text(tag="pos_index_input", label="Positions", width=-100, parent=p)
+            def load():
+                chars_raw = dpg.get_value("pos_chars_input")
+                idx_raw = dpg.get_value("pos_index_input")
+                constraints.string_in_position_list = chars_raw.split() if chars_raw.strip() else []
+                try:
+                    constraints.string_in_position_index_list = [int(i) for i in idx_raw.split()] if idx_raw.strip() else []
+                except ValueError:
+                    constraints.string_in_position_index_list = []
+                return f"chars={constraints.string_in_position_list} at={constraints.string_in_position_index_list}"
+            dpg.add_button(label="Apply", callback=_make_apply_callback("str_pos", "String In Position", load), parent=p)
+        _add_constraint(lexical, "str_pos", "String In Position",
+                        "Force particular characters at specific positions.\nRecommended: combine with whitespace stripping.",
+                        _str_pos_opts, height=160)
+
+        def _starts_opts(p):
+            dpg.add_text("String that tokens must start with", parent=p)
+            dpg.add_input_text(tag="starts_input", label="Prefix", width=-100, parent=p)
+            def load():
+                constraints.starts_with_string = dpg.get_value("starts_input")
+                return constraints.starts_with_string
+            dpg.add_button(label="Apply", callback=_make_apply_callback("starts", "Starts With", load), parent=p)
+        _add_constraint(lexical, "starts", "String Starts With",
+                        "Guarantee tokens start with a particular string.", _starts_opts)
+
+        def _ends_opts(p):
+            dpg.add_text("String that tokens must end with", parent=p)
+            dpg.add_input_text(tag="ends_input", label="Suffix", width=-100, parent=p)
+            def load():
+                constraints.ends_with_string = dpg.get_value("ends_input")
+                return constraints.ends_with_string
+            dpg.add_button(label="Apply", callback=_make_apply_callback("ends", "Ends With", load), parent=p)
+        _add_constraint(lexical, "ends", "String Ends With",
+                        "Guarantee tokens end with a particular string.", _ends_opts)
+
+        def _len_eq_opts(p):
+            dpg.add_text("Exact length tokens must match", parent=p)
+            dpg.add_input_int(tag="len_eq_input", label="Length", parent=p)
+            def load():
+                constraints.constrained_length = dpg.get_value("len_eq_input")
+                return str(constraints.constrained_length)
+            dpg.add_button(label="Apply", callback=_make_apply_callback("len_eq", "Length Equal To", load), parent=p)
+        _add_constraint(lexical, "len_eq", "String Length Equal To",
+                        "Guarantee tokens are exactly this length.\nRecommended: combine with whitespace stripping.",
+                        _len_eq_opts)
+
+        def _len_gt_opts(p):
+            dpg.add_text("Minimum length (exclusive)", parent=p)
+            dpg.add_input_int(tag="len_gt_input", label="Min Length", parent=p)
+            def load():
+                constraints.constrained_gt_length = dpg.get_value("len_gt_input")
+                return str(constraints.constrained_gt_length)
+            dpg.add_button(label="Apply", callback=_make_apply_callback("len_gt", "Length Greater Than", load), parent=p)
+        _add_constraint(lexical, "len_gt", "String Length Greater Than",
+                        "Guarantee tokens are longer than this length.", _len_gt_opts)
+
+        def _len_lt_opts(p):
+            dpg.add_text("Maximum length (exclusive)", parent=p)
+            dpg.add_input_int(tag="len_lt_input", label="Max Length", parent=p)
+            def load():
+                constraints.constrained_lt_length = dpg.get_value("len_lt_input")
+                return str(constraints.constrained_lt_length)
+            dpg.add_button(label="Apply", callback=_make_apply_callback("len_lt", "Length Less Than", load), parent=p)
+        _add_constraint(lexical, "len_lt", "String Length Less Than",
+                        "Guarantee tokens are shorter than this length.", _len_lt_opts)
+
+    # --- Phonetic Tab ---
+    with dpg.tab(label="Phonetic", parent=tab_bar_tag) as phonetic:
+
+        def _phonetic_opts(p):
+            dpg.add_text("Word to phonetically match against", parent=p)
+            dpg.add_input_text(tag="phonetic_input", label="Match Word", width=-100, parent=p)
+            def load():
+                constraints.phonetic_matching_string = dpg.get_value("phonetic_input")
+                return constraints.phonetic_matching_string
+            dpg.add_button(label="Apply", callback=_make_apply_callback("phonetic", "Phonetic Matching", load), parent=p)
+        _add_constraint(phonetic, "phonetic", "Phonetic Matching",
+                        "Uses the Metaphone algorithm to phonetically match tokens against the given word.",
+                        _phonetic_opts)
+
+        def _syllable_opts(p):
+            dpg.add_text("Number of syllables required", parent=p)
+            dpg.add_input_int(tag="syllable_input", label="Syllables", parent=p)
+            def load():
+                constraints.syllable_number = dpg.get_value("syllable_input")
+                return str(constraints.syllable_number)
+            dpg.add_button(label="Apply", callback=_make_apply_callback("syllable", "Syllable Count", load), parent=p)
+        _add_constraint(phonetic, "syllable", "Syllable Count",
+                        "Return tokens with the specified number of syllables.", _syllable_opts)
+
+        def _meter_opts(p):
+            dpg.add_text("Word whose stress pattern (meter) to match", parent=p)
+            dpg.add_input_text(tag="meter_input", label="Meter Word", width=-100, parent=p)
+            def load():
+                constraints.meter_string = dpg.get_value("meter_input")
+                return constraints.meter_string
+            dpg.add_button(label="Apply", callback=_make_apply_callback("meter", "Meter", load), parent=p)
+        _add_constraint(phonetic, "meter", "Meter",
+                        "Return tokens matching the stress pattern (meter) of the given word.", _meter_opts)
+
+        def _rhyme_opts(p):
+            dpg.add_text("Word to rhyme with", parent=p)
+            dpg.add_input_text(tag="rhyme_input", label="Rhyme Word", width=-100, parent=p)
+            def load():
+                constraints.rhyme_string = dpg.get_value("rhyme_input")
+                return constraints.rhyme_string
+            dpg.add_button(label="Apply", callback=_make_apply_callback("rhyme", "Rhyme", load), parent=p)
+        _add_constraint(phonetic, "rhyme", "Rhyme",
+                        "Return tokens that rhyme with the given word.", _rhyme_opts)
+
+    # --- Semantic Tab ---
+    with dpg.tab(label="Semantic", parent=tab_bar_tag) as semantic:
+
+        def _semantic_opts(p):
+            dpg.add_text("Word to match semantically (uses FastText vectors)", parent=p)
+            dpg.add_input_text(tag="semantic_input", label="Word", width=-100, parent=p)
+            dpg.add_input_float(tag="semantic_threshold", label="Min Similarity (0-1)", default_value=0.5, parent=p)
+            def load():
+                constraints.semantic_matching_string = dpg.get_value("semantic_input")
+                constraints.semantic_distance_threshold = dpg.get_value("semantic_threshold")
+                return f"{constraints.semantic_matching_string} (>= {constraints.semantic_distance_threshold:.2f})"
+            dpg.add_button(label="Apply", callback=_make_apply_callback("semantic", "Semantic Matching", load), parent=p)
+        _add_constraint(semantic, "semantic", "Semantic Matching",
+                        "Return tokens semantically similar to the given word using FastText vectors.",
+                        _semantic_opts, height=130)
+
+        def _edit_dist_opts(p):
+            dpg.add_text("Word to match using Levenshtein edit distance", parent=p)
+            dpg.add_input_text(tag="edit_dist_input", label="Word", width=-100, parent=p)
+            dpg.add_input_int(tag="edit_dist_threshold", label="Max Distance", default_value=2, parent=p)
+            def load():
+                constraints.string_edit_string = dpg.get_value("edit_dist_input")
+                constraints.string_edit_distance_threshold = dpg.get_value("edit_dist_threshold")
+                return f"{constraints.string_edit_string} (<= {constraints.string_edit_distance_threshold})"
+            dpg.add_button(label="Apply", callback=_make_apply_callback("edit_dist", "Edit Distance", load), parent=p)
+        _add_constraint(semantic, "edit_dist", "String Edit Distance",
+                        "Return tokens within the specified Levenshtein edit distance of the given word.",
+                        _edit_dist_opts, height=130)
+
+    # --- Structural Tab ---
+    with dpg.tab(label="Structural", parent=tab_bar_tag) as structural:
+
+        def _palindrome_opts(p):
+            dpg.add_text("Palindrome constraint is controlled by the checkbox above.", parent=p)
+        _add_constraint(structural, "palindrome", "Palindrome",
+                        "A palindrome reads the same backward as forward (madam, racecar).",
+                        _palindrome_opts, height=40, toggle_attr="palindrome_enabled")
+
+        def _anagram_opts(p):
+            dpg.add_text("String that tokens must be anagrams of", parent=p)
+            dpg.add_input_text(tag="anagram_input", label="Anagram String", width=-100, parent=p)
+            def load():
+                constraints.anagram_string = dpg.get_value("anagram_input")
+                return constraints.anagram_string
+            dpg.add_button(label="Apply", callback=_make_apply_callback("anagram", "Anagram", load), parent=p)
+        _add_constraint(structural, "anagram", "Anagram",
+                        "An anagram is formed by rearranging all letters of a different string.", _anagram_opts)
+
+        def _partial_anagram_opts(p):
+            dpg.add_text("String that tokens must be partial anagrams of", parent=p)
+            dpg.add_input_text(tag="partial_anagram_input", label="Source String", width=-100, parent=p)
+            def load():
+                constraints.partial_anagram_string = dpg.get_value("partial_anagram_input")
+                return constraints.partial_anagram_string
+            dpg.add_button(label="Apply", callback=_make_apply_callback("partial_anagram", "Partial Anagram", load), parent=p)
+        _add_constraint(structural, "partial_anagram", "Partial Anagram",
+                        "A partial anagram uses some or all letters of a different string.", _partial_anagram_opts)
+
+        def _isogram_opts(p):
+            dpg.add_text("Max times any character may repeat", parent=p)
+            dpg.add_input_int(tag="isogram_input", label="Max Repeats", default_value=1, parent=p)
+            def load():
+                constraints.isogram_count = dpg.get_value("isogram_input")
+                return str(constraints.isogram_count)
+            dpg.add_button(label="Apply", callback=_make_apply_callback("isogram", "Isogram", load), parent=p)
+        _add_constraint(structural, "isogram", "Isogram",
+                        "An isogram has no character appearing more than N times.", _isogram_opts)
+
+        def _rev_isogram_opts(p):
+            dpg.add_text("Min times every character must repeat", parent=p)
+            dpg.add_input_int(tag="rev_isogram_input", label="Min Repeats", default_value=1, parent=p)
+            def load():
+                constraints.reverse_isogram_count = dpg.get_value("rev_isogram_input")
+                return str(constraints.reverse_isogram_count)
+            dpg.add_button(label="Apply", callback=_make_apply_callback("rev_isogram", "Reverse Isogram", load), parent=p)
+        _add_constraint(structural, "rev_isogram", "Reverse Isogram",
+                        "A reverse isogram has every character appearing at least N times.", _rev_isogram_opts)
+
+
+# ============================================================================
+# Application Entry Point
+# ============================================================================
+
+def main():
+    global fasttext_model
+
+    # Load FastText model for semantic matching
+    try:
+        model_path = hf_hub_download("osanseviero/fasttext_embedding", "model.bin")
+        fasttext_model = fasttext.load_model(model_path)
+    except Exception as e:
+        print(f"Warning: Could not load FastText model: {e}")
+        print("Semantic matching will be unavailable.")
+
+    # --- DearPyGUI Setup ---
+    dpg.create_context()
+
+    monitor = get_monitors()[0]
+    screen_width = monitor.width
+    screen_height = monitor.height
+
+    dpg.create_viewport(title="CTGS - Constrained Text Generation Studio",
+                        width=screen_width, height=screen_height)
+    dpg.setup_dearpygui()
+    dpg.enable_docking(dock_space=True)
+
+    # Font (with fallback)
+    font_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "OpenSans-VariableFont_wdth,wght.ttf")
+    if os.path.exists(font_path):
+        with dpg.font_registry():
+            font = dpg.add_font(font_path, 16, tag="ttf-font")
+        dpg.bind_font(font)
+
+    # Theme
+    with dpg.theme() as global_theme:
+        with dpg.theme_component(dpg.mvAll):
+            dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 4)
+            dpg.add_theme_style(dpg.mvStyleVar_WindowRounding, 6)
+            dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 6, 4)
+            dpg.add_theme_color(dpg.mvThemeCol_TitleBgActive, (50, 90, 140))
+            dpg.add_theme_color(dpg.mvThemeCol_Button, (60, 110, 160))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (80, 135, 190))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (40, 85, 130))
+            dpg.add_theme_color(dpg.mvThemeCol_Tab, (50, 90, 140))
+            dpg.add_theme_color(dpg.mvThemeCol_TabHovered, (70, 120, 170))
+            dpg.add_theme_color(dpg.mvThemeCol_TabActive, (60, 110, 160))
+    dpg.bind_theme(global_theme)
+
+    # Layout sizes
+    w = screen_width // 2
+    h = int(screen_height // 2.5)
+
+    # --- Main Text Window ---
+    with dpg.window(tag="main_window", label="CTGS - Constrained Text Generation Studio",
+                    no_close=True, width=w, height=h, pos=(0, 0)):
+        dpg.add_text("Right-click in the text box for AI-suggested continuations with constraints applied")
+        dpg.add_input_text(tag="input_string", width=-1, height=300, multiline=True,
+                           default_value="Type something here!")
+
+        with dpg.popup(parent="input_string", tag="token_popup"):
+            dpg.add_text("Press 'Predict New Tokens' or F1 to see suggestions")
+
+        dpg.add_text(tag="status_text", default_value="Loading model...", color=[120, 200, 120])
         dpg.add_separator()
-        if len(returned_words) >= 1:
-            for word in returned_words:
-                dpg.add_selectable(label=word, user_data = word[0], callback = add_generated_word_callback)
-        else:
-            dpg.add_text("No results with the current filters")
-            #print(dpg.get_value(word))
-            #print(dpg.get_value("yum"))
-    #dpg.log_debug(value)
 
-def typed_calledback(sender, app_data, user_data):
-    dpg.set_value("pretty_input_string", str(app_data))
-
-def lipogram_callback(sender, app_data, user_data):
-    if app_data == True:
-        dpg.show_item("Lipogram Options")
-    else:
-        dpg.hide_item("Lipogram Options")
-
-def load_naughty_strings_callback():
-    global lipogram_naughty_word_list
-    string_input = dpg.get_value("lipogram_word_list")
-    lipogram_naughty_word_list = string_input.split(" ")
-    if not dpg.get_value("naughty_applied"):
-        dpg.add_text(tag = "naughty_applied", default_value= "Naughty Strings Applied!", parent = "Lipogram Options")
-        dpg.add_text(tag = "naughty_filter" , default_value = "Naughty Strings Filter: " + string_input, parent = "main_window", before = "lipogram")
-    else:
-        dpg.set_value(item = "naughty_filter", value = "Naughty Strings Filter: " + string_input)
-    edit_string_callback()
-
-def weak_lipogram_callback(sender, app_data, user_data):
-    if app_data == True:
-        dpg.show_item("Weak Lipogram Options")
-    else:
-        dpg.hide_item("Weak Lipogram Options")
-
-def load_weak_naughty_strings_callback():
-    global weak_lipogram_naughty_word_list
-    string_input = dpg.get_value("weak_lipogram_word_list")
-    weak_lipogram_naughty_word_list = string_input.split(" ")
-    if not dpg.get_value("weak_naughty_applied"):
-        dpg.add_text(tag = "weak_naughty_applied", default_value= "Weak Naughty Strings Applied!", parent = "Weak Lipogram Options")
-        dpg.add_text(tag = "weak_naughty_filter" , default_value = "Weak Naughty Strings Filter: " + string_input, parent = "main_window", before = "lipogram")
-    else:
-        dpg.set_value(item = "weak_naughty_filter", value = "Weak Naughty Strings Filter: " + string_input)
-    edit_string_callback()
-
-def reverse_lipogram_callback(sender, app_data, user_data):
-    if app_data == True:
-        dpg.show_item("Reverse Lipogram Options")
-    else:
-        dpg.hide_item("Reverse Lipogram Options")
-
-def load_reverse_naughty_strings_callback():
-    global reverse_lipogram_nice_word_list
-    string_input = dpg.get_value("reverse_lipogram_word_list")
-    reverse_lipogram_nice_word_list = string_input.split(" ")
-    if not dpg.get_value("reverse_nice_applied"):
-        dpg.add_text(tag = "reverse_nice_applied", default_value= "Nice Strings Applied!", parent = "Reverse Lipogram Options")
-        dpg.add_text(tag = "reverse_nice_filter" , default_value = "Nice Strings Filter: " + string_input, parent = "main_window", before = "lipogram")
-    else:
-        dpg.set_value(item = "reverse_nice_filter", value = "Nice Strings Filter: " + string_input)
-    edit_string_callback()
-
-def weak_reverse_lipogram_callback(sender, app_data, user_data):
-    if app_data == True:
-        dpg.show_item("Weak Reverse Lipogram Options")
-    else:
-        dpg.hide_item("Weak Reverse Lipogram Options")
-
-def load_weak_reverse_naughty_strings_callback():
-    global weak_reverse_lipogram_nice_word_list
-    string_input = dpg.get_value("weak_reverse_lipogram_word_list")
-    weak_reverse_lipogram_nice_word_list = string_input.split(" ")
-    if not dpg.get_value("weak_reverse_nice_applied"):
-        dpg.add_text(tag = "weak_reverse_nice_applied", default_value= "Weak Nice Strings Applied!", parent = "Weak Reverse Lipogram Options")
-        dpg.add_text(tag = "weak_reverse_nice_filter" , default_value = "Weak Nice Strings Filter: " + string_input, parent = "main_window", before = "lipogram")
-    else:
-        dpg.set_value(item = "weak_reverse_nice_filter", value = "Weak Nice Strings Filter: " + string_input)
-    edit_string_callback()
-
-def string_position_callback(sender, app_data, user_data):
-    if app_data == True:
-        dpg.show_item("Letter Position Options")
-    else:
-        dpg.hide_item("Letter Position Options")
-
-def load_string_positon_callback():
-    global string_in_positon_list
-    global string_in_positon_index_list
-    string_input = dpg.get_value("string_for_position")
-    int_input = dpg.get_value("string_position_int")
-    string_in_positon_list = string_input.split(" ")
-    string_in_positon_index_list = int_input.split(" ")
-    string_in_positon_index_list = [int(i) for i in string_in_positon_index_list]
-    if not dpg.get_value("string_postion_applied"):
-        dpg.add_text(tag = "string_postion_applied", default_value= "Strings in Position Applied!", parent = "Letter Position Options")
-        dpg.add_text(tag = "string_postion_filter" , default_value = "Strings in Position Applied:  " + string_input + " " + str(int_input), parent = "main_window", before = "lipogram")
-    else:
-        dpg.set_value(item = "string_postion_filter", value = "Strings in Position Filter: " + string_input + " " + str(int_input))
-    edit_string_callback()
-
-
-
-def string_starts_with_callback(sender, app_data, user_data):
-    if app_data == True:
-        dpg.show_item("Starting String Options")
-    else:
-        dpg.hide_item("Starting String Options")
-
-def load_string_starts_with_callback():
-    global starts_with_string
-    starts_with_string = dpg.get_value("string_start_word")
-    if not dpg.get_value("string_starts_with_applied"):
-        dpg.add_text(tag = "string_starts_with_applied", default_value= "Starting String Applied!", parent = "Starting String Options")
-        dpg.add_text(tag = "string_starts_with_filter" , default_value = "Starting String Applied!  " + starts_with_string, parent = "main_window", before = "lipogram")
-    else:
-        dpg.set_value(item = "string_starts_with_filter", value = "Starting String Filter: " + starts_with_string)
-    edit_string_callback()
-
-def string_ends_with_callback(sender, app_data, user_data):
-    if app_data == True:
-        dpg.show_item("Ending String Options")
-    else:
-        dpg.hide_item("Ending String Options")
-
-def load_string_ends_with_callback():
-    global ends_with_string
-    ends_with_string = dpg.get_value("string_end_word")
-    if not dpg.get_value("string_ends_with_applied"):
-        dpg.add_text(tag = "string_ends_with_applied", default_value= "Ending String Applied!", parent = "Ending String Options")
-        dpg.add_text(tag = "string_ends_with_filter" , default_value = "Ending String Applied!  " + ends_with_string, parent = "main_window", before = "lipogram")
-    else:
-        dpg.set_value(item = "string_ends_with_filter", value = "Ending String Filter: " + ends_with_string)
-    edit_string_callback()
-
-def string_length_constrained_callback(sender, app_data, user_data):
-    if app_data == True:
-        dpg.show_item("Length Constrained Options")
-    else:
-        dpg.hide_item("Length Constrained Options")
-
-def load_string_length_constrained_callback():
-    global constrained_length
-    constrained_length = dpg.get_value("length_constrained_number")
-    constrained_length_str = str(constrained_length)
-    if not dpg.get_value("string_length_constrained_applied"):
-        dpg.add_text(tag = "string_length_constrained_applied", default_value= "String Length Constraint Applied!", parent = "Length Constrained Options")
-        dpg.add_text(tag = "string_length_constrained_filter" , default_value = "String Length Constraint Applied!  " + constrained_length_str, parent = "main_window", before = "lipogram")
-    else:
-        dpg.set_value(item = "string_length_constrained_filter", value = "String Length Constraint Filter: " + constrained_length_str)
-    edit_string_callback()
-
-def string_length_gt_constrained_callback(sender, app_data, user_data):
-    if app_data == True:
-        dpg.show_item("Length Greater Than Options")
-    else:
-        dpg.hide_item("Length Greater Than Options")
-
-def load_string_length_gt_constrained_callback():
-    global constrained_gt_length
-    constrained_gt_length = dpg.get_value("length_gt_constrained_number")
-    constrained_gt_length_str = str(constrained_gt_length)
-    if not dpg.get_value("string_length_gt_constrained_applied"):
-        dpg.add_text(tag = "string_length_gt_constrained_applied", default_value= "String Length Greater Than Constraint Applied!", parent = "Length Greater Than Options")
-        dpg.add_text(tag = "string_length_gt_constrained_filter" , default_value = "String Length Greater Than Constraint Applied!  " + constrained_gt_length_str, parent = "main_window", before = "lipogram")
-    else:
-        dpg.set_value(item = "string_length_gt_constrained_filter", value = "String Length Greater Than Constraint Filter: " + constrained_gt_length_str)
-    edit_string_callback()
-
-
-def string_length_lt_constrained_callback(sender, app_data, user_data):
-    if app_data == True:
-        dpg.show_item("Length Lesser Than Options")
-    else:
-        dpg.hide_item("Length Lesser Than Options")
-
-def load_string_length_lt_constrained_callback():
-    global constrained_lt_length
-    constrained_lt_length = dpg.get_value("length_lt_constrained_number")
-    constrained_lt_length_str = str(constrained_lt_length)
-    if not dpg.get_value("string_length_lt_constrained_applied"):
-        dpg.add_text(tag = "string_length_lt_constrained_applied", default_value= "String Length Lesser Than Constraint Applied!", parent = "Length Lesser Than Options")
-        dpg.add_text(tag = "string_length_lt_constrained_filter" , default_value = "String Length Lesser Than Constraint Applied!  " + constrained_lt_length_str, parent = "main_window", before = "lipogram")
-    else:
-        dpg.set_value(item = "string_length_lt_constrained_filter", value = "String Length Lesser Than Constraint Filter: " + constrained_lt_length_str)
-    edit_string_callback()
-
-
-def phonetic_callback(sender, app_data, user_data):
-    if app_data == True:
-        dpg.show_item("Phonetic Options")
-    else:
-        dpg.hide_item("Phonetic Options")
-
-def load_phonetic_callback():
-    global phonetic_matching_string
-    phonetic_matching_string = dpg.get_value("phonetic_word")
-    if not dpg.get_value("phonetic_applied"):
-        dpg.add_text(tag = "phonetic_applied", default_value= "Phonetic Constraint Applied!", parent = "Phonetic Options")
-        dpg.add_text(tag = "phonetic_filter" , default_value = "Phonetic Constraint Applied!  " + phonetic_matching_string, parent = "main_window", before = "lipogram")
-    else:
-        dpg.set_value(item = "phonetic_filter", value = "Phonetic Constraint Filter: " + phonetic_matching_string)
-    edit_string_callback()
-
-def semantic_callback(sender, app_data, user_data):
-    if app_data == True:
-        dpg.show_item("Semantic Options")
-    else:
-        dpg.hide_item("Semantic Options")
-
-def load_semantic_callback():
-    global semantic_matching_string
-    global semantic_distance_threshold
-    semantic_matching_string = dpg.get_value("semantic_word")
-    semantic_distance_threshold = dpg.get_value("semantic_distance")
-    semantic_distance_threshold_string = str(semantic_distance_threshold)
-    if not dpg.get_value("semantic_applied"):
-        dpg.add_text(tag = "semantic_applied", default_value= "Semantic Constraint Applied!", parent = "Semantic Options")
-        dpg.add_text(tag = "semantic_filter" , default_value = "Semantic Constraint Applied!  " + semantic_matching_string + " Minimum Similarity: " + semantic_distance_threshold_string, parent = "main_window", before = "lipogram")
-    else:
-        dpg.set_value(item = "semantic_filter", value = "Semantic Constraint Filter: " + semantic_matching_string)
-    edit_string_callback()
-
-
-def string_edit_callback(sender, app_data, user_data):
-    if app_data == True:
-        dpg.show_item("String Edit Options")
-    else:
-        dpg.hide_item("String Edit Options")
-
-def load_string_edit_callback():
-    global string_edit_string
-    global string_edit_distnace_threhold
-    string_edit_string = dpg.get_value("string_edit_word")
-    string_edit_distnace_threhold = dpg.get_value("string_edit_distance")
-    string_edit_distnace_threhold_string = str(string_edit_distnace_threhold)
-    if not dpg.get_value("string_edit_applied"):
-        dpg.add_text(tag = "string_edit_applied", default_value= "String Edit Constraint Applied!", parent = "String Edit Options")
-        dpg.add_text(tag = "string_edit_filter" , default_value = "String Constraint Applied!  " + string_edit_string + " Minimum Similarity: " + string_edit_distnace_threhold_string, parent = "main_window", before = "lipogram")
-    else:
-        dpg.set_value(item = "string_edit_filter", value = "String Constraint Filter: " + string_edit_string)
-    edit_string_callback()
-
-def syllable_callback(sender, app_data, user_data):
-    if app_data == True:
-        dpg.show_item("Syllable Options")
-    else:
-        dpg.hide_item("Syllable Options")
-
-def load_syllable_callback():
-    global syllable_number
-    syllable_number = dpg.get_value("syllable_number")
-    syllable_number_string = str(syllable_number)
-    if not dpg.get_value("syllable_applied"):
-        dpg.add_text(tag = "syllable_applied", default_value= "Syllable Constraint Applied!", parent = "Syllable Options")
-        dpg.add_text(tag = "syllable_filter" , default_value = "Syllable Constraint Applied!  " + syllable_number_string,  parent = "main_window", before = "lipogram")
-    else:
-        dpg.set_value(item = "syllable_filter", value = "Syllable Constraint Filter: " + syllable_number_string)
-    edit_string_callback()
-
-def meter_callback(sender, app_data, user_data):
-    if app_data == True:
-        dpg.show_item("Meter Options")
-    else:
-        dpg.hide_item("Meter Options")
-
-def load_meter_callback():
-    global meter_string
-    meter_string = dpg.get_value("meter_word")
-    if not dpg.get_value("meter_applied"):
-        dpg.add_text(tag = "meter_applied", default_value= "Meter Constraint Applied!", parent = "Meter Options")
-        dpg.add_text(tag = "meter_filter" , default_value = "Meter Constraint Applied!  " + meter_string, parent = "main_window", before = "lipogram")
-    else:
-        dpg.set_value(item = "meter_filter", value = "Meter Constraint Filter: " + meter_string)
-    edit_string_callback()
-
-def rhyme_callback(sender, app_data, user_data):
-    if app_data == True:
-        dpg.show_item("Rhyme Options")
-    else:
-        dpg.hide_item("Rhyme Options")
-
-def load_rhyme_callback():
-    global rhyme_string
-    rhyme_string = dpg.get_value("rhyme_word")
-    if not dpg.get_value("rhyme_applied"):
-        dpg.add_text(tag = "rhyme_applied", default_value= "Rhyme Constraint Applied!", parent = "Rhyme Options")
-        dpg.add_text(tag = "rhyme_filter" , default_value = "Rhyme Constraint Applied!  " + rhyme_string, parent = "main_window", before = "lipogram")
-    else:
-        dpg.set_value(item = "rhyme_filter", value = "Rhyme Constraint Filter: " + rhyme_string)
-    edit_string_callback()
-
-
-
-def palindrome_callback(sender, app_data, user_data):
-    global palindrome_enabled
-    if app_data == True:
-        dpg.show_item("Palindrome Options")
-        palindrome_enabled = True
-    else:
-        dpg.hide_item("Palindrome Options")
-        palindrome_enabled = False
-
-def load_palindrome_callback():
-    global palindrome_enabled
-    if not dpg.get_value("palindrome_applied"):
-        dpg.add_text(tag = "palindrome_applied", default_value= "String Palindromeic Constraint Applied!", parent = "Palindrome Options")
-        dpg.add_text(tag = "palindrome_filter" , default_value = "String Palindromeic Constraint Applied!  ",  parent = "main_window", before = "lipogram")
-    else:
-        dpg.set_value(item = "palindrome_filter", value = "String Palindromeic Constraint Applied! ")
-    edit_string_callback()
-
-def anagram_callback(sender, app_data, user_data):
-    if app_data == True:
-        dpg.show_item("Anagram Options")
-    else:
-        dpg.hide_item("Anagram Options")
-
-def load_anagram_callback():
-    global anagram_string
-    anagram_string = dpg.get_value("anagram_string")
-    if not dpg.get_value("anagram_applied"):
-        dpg.add_text(tag = "anagram_applied", default_value= "Anagram Applied!", parent = "Anagram Options")
-        dpg.add_text(tag = "anagram_filter" , default_value = "Anagram Applied!  " + anagram_string, parent = "main_window", before = "lipogram")
-    else:
-        dpg.set_value(item = "anagram_filter", value = "Anagram Filter: " + anagram_string)
-    edit_string_callback()
-
-def partial_anagram_callback(sender, app_data, user_data):
-    if app_data == True:
-        dpg.show_item("Partial Anagram Options")
-    else:
-        dpg.hide_item("Partial Anagram Options")
-
-def load_partial_anagram_callback():
-    global partial_anagram_string
-    partial_anagram_string = dpg.get_value("partial_anagram_string")
-    if not dpg.get_value("partial_anagram_applied"):
-        dpg.add_text(tag = "partial_anagram_applied", default_value= "Partial Anagram Applied!", parent = "Partial Anagram Options")
-        dpg.add_text(tag = "partial_anagram_filter" , default_value = "Partial Anagram Applied!  " + partial_anagram_string, parent = "main_window", before = "lipogram")
-    else:
-        dpg.set_value(item = "partial_anagram_filter", value = "Partial Anagram Filter: " + partial_anagram_string)
-    edit_string_callback()
-
-def isogram_callback(sender, app_data, user_data):
-    if app_data == True:
-        dpg.show_item("Isogram Options")
-    else:
-        dpg.hide_item("Isogram Options")
-
-def load_isogram_callback():
-    global isogram_count
-    isogram_count = dpg.get_value("isogram_number")
-    isogram_count_str = str(isogram_count)
-    if not dpg.get_value("isogram_applied"):
-        dpg.add_text(tag = "isogram_applied", default_value= "Isogram Applied!", parent = "Isogram Options")
-        dpg.add_text(tag = "isogram_filter" , default_value = "Isogram Applied!  " + isogram_count_str, parent = "main_window", before = "lipogram")
-    else:
-        dpg.set_value(item = "isogram_filter", value = "Isogram Filter: " + isogram_count_str)
-    edit_string_callback()
-
-def reverse_isogram_callback(sender, app_data, user_data):
-    if app_data == True:
-        dpg.show_item("Reverse Isogram Options")
-    else:
-        dpg.hide_item("Reverse Isogram Options")
-
-def load_reverse_isogram_callback():
-    global reverse_isogram_count
-    reverse_isogram_count = dpg.get_value("reverse_isogram_number")
-    reverse_isogram_count_str = str(reverse_isogram_count)
-    if not dpg.get_value("reverse_isogram_applied"):
-        dpg.add_text(tag = "reverse_isogram_applied", default_value= "Reverse Isogram Applied!", parent = "Reverse Isogram Options")
-        dpg.add_text(tag = "reverse_isogram_filter" , default_value = "Reverse Isogram Applied!  " + reverse_isogram_count_str, parent = "main_window", before = "lipogram")
-    else:
-        dpg.set_value(item = "reverse_isogram_filter", value = "Reverse Isogram Filter: " + reverse_isogram_count_str)
-    edit_string_callback()
-
-
-def turn_filters_off_callback():
-    global lipogram_naughty_word_list
-    global weak_lipogram_naughty_word_list
-    global reverse_lipogram_nice_word_list
-    global weak_reverse_lipogram_nice_word_list
-    global string_in_positon_list
-    global string_in_positon_index_list
-    global starts_with_string
-    global ends_with_string
-    global phonetic_matching_string
-    global semantic_matching_string
-    global semantic_distance_threshold
-    global constrained_length
-    global constrained_gt_length
-    global constrained_lt_length
-    global palindrome_enabled
-    global anagram_string
-    global partial_anagram_string
-    global isogram_count
-    global reverse_isogram_count 
-    global string_edit_string
-    global string_edit_distnace_threhold
-    global syllable_number
-    global meter_string
-    global rhyme_string
-
-    lipogram_naughty_word_list = []
-    weak_lipogram_naughty_word_list = []
-    reverse_lipogram_nice_word_list = []
-    weak_reverse_lipogram_nice_word_list = []
-    string_in_positon_list = []
-    string_in_positon_index_list = []
-    starts_with_string = ""
-    ends_with_string = ""
-    phonetic_matching_string = ""
-    semantic_matching_string = ""
-    semantic_distance_threshold = 0.0
-    string_edit_string = ""
-    string_edit_distnace_threhold = 0
-    syllable_number = 0
-    meter_string = ""
-    rhyme_string = ""
-    constrained_length = 0
-    constrained_gt_length = 0
-    constrained_lt_length = 0
-    palindrome_enabled = False
-    anagram_string = ""
-    partial_anagram_string = ""
-    isogram_count = 0
-    reverse_isogram_count = 0
- 
-    filters = [
-    "partial_anagram_applied", "partial_anagram_filter",
-    "naughty_applied", "naughty_filter",
-    "weak_naughty_applied", "weak_naughty_filter",
-    "reverse_nice_applied", "reverse_nice_filter",
-    "weak_reverse_nice_applied", "weak_reverse_nice_filter",
-    "string_position_applied", "string_position_filter",
-    "string_starts_with_applied", "string_starts_with_filter",
-    "string_ends_with_applied", "string_ends_with_filter",
-    "string_length_constrained_applied", "string_length_constrained_filter",
-    "string_length_gt_constrained_applied", "string_length_gt_constrained_filter",
-    "string_length_lt_constrained_applied", "string_length_lt_constrained_filter",
-    "phonetic_applied", "phonetic_filter",
-    "semantic_applied", "semantic_filter",
-    "string_edit_applied", "string_edit_filter",
-    "syllable_applied", "syllable_filter",
-    "meter_applied", "meter_filter",
-    "rhyme_applied", "rhyme_filter",
-    "palindrome_applied", "palindrome_filter",
-    "anagram_applied", "anagram_filter",
-    "isogram_applied", "isogram_filter",
-    "reverse_isogram_applied", "reverse_isogram_filter"]
-
-    for filter_name in filters:
-        if dpg.get_value(filter_name):
-            dpg.delete_item(filter_name)
-
-    edit_string_callback()
-    #TODO: Finish this
-
-
-dpg.create_context()
-monitor = get_monitors()[0]
-screen_width = monitor.width
-screen_height = monitor.height
-dpg.create_viewport(width=screen_width, height=screen_height)
-dpg.setup_dearpygui()
-dpg.toggle_viewport_fullscreen()
-
-#dpg.configure_app(docking=True, dock_space = True)
-
-dpg.enable_docking(dock_space=True)
-
-with dpg.font_registry():
-    # Download font here: https://fonts.google.com/specimen/Open+Sans
-    font = dpg.add_font("OpenSans-VariableFont_wdth,wght.ttf", 15, tag="ttf-font"
-    )
-
-dpg.bind_font(font)
-readme_pos = ((screen_width) // 2, (screen_height) // 2)
-window_size = (screen_width // 2, screen_height // 2.5)
-window_positions = [
-    (0, 0),
-    (window_size[0], window_size[1]),
-    (window_size[0] * 2, 0),
-    (window_size[0], 0),
-]
-
-
-"""
-Doesn't work... 
-
-def edited_call(sender, app_data, user_data):
-    global starttime
-    newtime = time.time()
-    if newtime - starttime > 2:
-        print(dpg.get_item_)
-        print(dpg.get_item_state("input_string"))
-        edit_string_callback()
-        starttime = newtime
-"""
-
-
-
-#edit_string_callback("This is an example")
-
-
-with dpg.window(tag="main_window", label="CTGS - Contrained Text Generation Studio", no_close=True, width=window_size[0], height=window_size[1], pos=window_positions[0]) as window:
-    dpg.add_text("Main Text Box")
-    dpg.add_text("Right Click within the text box for LM recommended continuations with constraints applied!")
-    dpg.add_input_text(tag = "input_string", width = 900, height = 500, multiline=True, default_value = "Type something here!")
-
-    with dpg.window(tag="load_model_window", label="Model Settings", no_close=True, width=window_size[0], height=window_size[1], pos=window_positions[1]) as model_window:
-        dpg.add_text("Enter the name of the pre-trained model from transformers that we are using for Text Generation")
-        _help("Make sure torch.cuda.is_available returns True to get GPU support for your models, which significantly speeds them up!")
-        dpg.add_text("This will download a new model, so it may take awhile or even break if the model is too large")
-        dpg.add_input_text(tag = "model_name", width = 500, height = 500, default_value="EleutherAI/pythia-1b", label = "Huggingface Model Name")
-        dpg.add_button(tag="load_model", label="load_model", callback=load_model)
-        _help("If ran from the commnad line, you can see the downloading progress in the terminal. Be patient, it can take awhile to download a model!")
-        dpg.add_combo(items=["32bit", "16bit", "8bit"], tag = "percision", label = "Select the model percision", default_value ="32bit")
-    with dpg.window(tag="Filter Options", label="Filters", show=True, no_close=True, width=window_size[0], height=window_size[1], pos=window_positions[2]) as filter_options:
-        dpg.add_text("Select which filters you want to enable")
-        dpg.add_text("List of enabled filters: ")
-        dpg.add_checkbox(tag="lipogram", label = "All Strings Banned", callback=lipogram_callback)
-        _help("A lipogram is when a particular letter or group of strings is avoided.")
-        with dpg.child_window(tag="Lipogram Options", show = False, height = 100, width = 600) as lipogram_selection_window:
-            dpg.add_text("Add banned letters or strings seperated by a space!")
-            dpg.add_input_text(tag = "lipogram_word_list", width = 500, height = 500, label = "Banned Strings")
-            dpg.add_button(tag="lipogram_button", label="Load Banned Strings", callback=load_naughty_strings_callback)
-        dpg.add_checkbox(tag="weak_lipogram", label = "Any Strings Banned", callback=weak_lipogram_callback)
-        _help("A weak lipogram is when at least one of a particular letter or group of strings is avoided.")
-        with dpg.child_window(tag="Weak Lipogram Options", show = False, height = 100, width = 600) as weak_lipogram_selection_window:
-            dpg.add_text("Add banned letters or strings seperated by a space!")
-            dpg.add_input_text(tag = "weak_lipogram_word_list", width = 500, height = 500, label = "Banned Strings")
-            dpg.add_button(tag="weak_lipogram_button", label="Load Banned Strings", callback = load_weak_naughty_strings_callback)
-        dpg.add_checkbox(tag="reverse_lipogram", label = "All Strings Required", callback=reverse_lipogram_callback)
-        _help("A reverse lipogram is when a particular letter or group of strings is forced.")
-        with dpg.child_window(tag="Reverse Lipogram Options", show = False, height = 100, width = 600) as reverse_lipogram_selection_window:
-            dpg.add_text("Add forced letters or strings seperated by a space!")
-            dpg.add_input_text(tag = "reverse_lipogram_word_list", width = 500, height = 500, label = "Forced Strings")
-            dpg.add_button(tag="reverse_lipogram_button", label="Load Forced Strings", callback = load_reverse_naughty_strings_callback)
-        dpg.add_checkbox(tag="weak_reverse_lipogram", label = "Any Strings Required", callback=weak_reverse_lipogram_callback)
-        _help("A weak reverse lipogram is when at least one of a particular letter or group of strings is forced.")
-
-
-        with dpg.child_window(tag="Weak Reverse Lipogram Options", show = False, height = 100, width = 600) as weak_reverse_selection_window:
-            dpg.add_text("Add forced letters or strings seperated by a space!")
-            dpg.add_input_text(tag = "weak_reverse_lipogram_word_list", width = 500, height = 500, label = "Forced Strings")
-            dpg.add_button(tag="weak_reverse_lipogram_button", label="Load Forced Strings", callback = load_weak_reverse_naughty_strings_callback)
-
-        dpg.add_checkbox(tag="string_position", label = "String In Position", callback = string_position_callback)
-        _help("This allows one to force a particular letter in a particular position of a string\n" "NOTE: It's recommended to combine this with whitespace stripping")
-
-        with dpg.child_window(tag="Letter Position Options", show = False, height = 130, width = 600) as letter_position_selection_window:
-            dpg.add_text("Add the position that you want to force a particular letter to appear at! Give a list of characters seperated by a space")
-            dpg.add_input_text(tag = "string_for_position", width = 500, height = 500, label = "List of characters")
-            dpg.add_text("Corresponding list of indexes for each character. Must be the same length as the list of characters")
-            dpg.add_input_text(tag = "string_position_int", width = 500, height = 500, label = "List of indexes")
-            dpg.add_button(tag="string_position_button", label="Load Strings", callback = load_string_positon_callback)
-
-        dpg.add_checkbox(tag="string_starts", label = "String Starts With", callback = string_starts_with_callback)
-        _help("This allows one to guarantee that the string will start with a particular set of letters")
-
-        with dpg.child_window(tag="Starting String Options", show = False, height = 100, width = 600) as starting_string_selection_window:
-            dpg.add_text("Add the string that the word should start with")
-            dpg.add_input_text(tag = "string_start_word", width = 500, height = 500, label = "String for word to start with")
-            dpg.add_button(tag="string_start_button", label="Load Starting String", callback=load_string_starts_with_callback)
-
-        dpg.add_checkbox(tag="string_ends", label = "String Ends With", callback = string_ends_with_callback)
-        _help("This allows one to guarantee that the string will end with a particular set of letters")
-        with dpg.child_window(tag="Ending String Options", show = False, height = 100, width = 600) as ending_string_selection_window:
-            dpg.add_text("Add the string that the word should end with")
-            dpg.add_input_text(tag = "string_end_word", width = 500, height = 500, label = "String for word to end with")
-            dpg.add_button(tag="string_end_button", label="Load Ending String", callback=load_string_ends_with_callback)
-
-        dpg.add_checkbox(tag="string_edit_distance_check", label = "String Edit Distance Matching", callback = string_edit_callback)
-        _help("This uses Levenshtein distance to return all strings with lower edit distance then specified")
-
-        with dpg.child_window(tag="String Edit Options", show = False, height = 100, width = 600) as string_edit_window:
-            dpg.add_text("Specify the word you want to string edit distance match against")
-            dpg.add_input_text(tag = "string_edit_word", width = 500, height = 500, label = "String to match using Levenshtein distance")
-            dpg.add_input_int(tag = "string_edit_distance", label = "Similarity that the word has to be higher than")
-            dpg.add_button(tag="string_edit_constrained_button", label="Load String Edit Distance Matching Strings", callback=load_string_edit_callback)
-
-        dpg.add_checkbox(tag="length_constrained", label = "String Length Equal To", callback = string_length_constrained_callback)
-        _help("This allows one to guarantee that the string will be of a particular length\n" "NOTE: It's recommended to combine this filter with whitespace stripping")
-        with dpg.child_window(tag="Length Constrained Options", show = False, height = 100, width = 600) as length_constrained_selection_window:
-            dpg.add_text("Specify the length that you want your strings to be constrained to")
-            dpg.add_input_int(tag = "length_constrained_number", label = "Number to constrain the length with")
-            dpg.add_button(tag="length_constrained_button", label="Load Length Constrained String", callback=load_string_length_constrained_callback)
-
-        dpg.add_checkbox(tag="length_gt", label = "String Length Greater Than", callback = string_length_gt_constrained_callback)
-        _help("This allows one to guarantee that the string will be longar than a particular length\n" "NOTE: It's recommended to combine this filter with whitespace stripping")
-
-        with dpg.child_window(tag="Length Greater Than Options", show = False, height = 100, width = 600) as length_gt_selection_window:
-            dpg.add_text("Specify the length that you want your strings to be greater than")
-            dpg.add_input_int(tag = "length_gt_constrained_number", label = "Number to constrain the length to be greater than")
-            dpg.add_button(tag="length_gt_constrained_button", label="Load Length Constrained String", callback=load_string_length_gt_constrained_callback)
-
-        dpg.add_checkbox(tag="length_lt", label = "String Length Lesser Than", callback = string_length_lt_constrained_callback)
-        _help("This allows one to guarantee that the string will be shorter than particular length\n" "NOTE: It's recommended to combine this filter with whitespace stripping")
-
-        with dpg.child_window(tag="Length Lesser Than Options", show = False, height = 100, width = 600) as length_lt_selection_window:
-            dpg.add_text("Specify the length that you want your strings to be lesser than")
-            dpg.add_input_int(tag = "length_lt_constrained_number", label = "Number to constrain the length to be lesser than")
-            dpg.add_button(tag="length_lt_constrained_button", label="Load Length Constrained String", callback=load_string_length_lt_constrained_callback)
-
-
-        dpg.add_checkbox(tag="phonetic", label = "Phonetic Matching", callback = phonetic_callback)
-        _help("This uses the double-metaphone algorithm to phonetically match your string with the passed in string")
-
-        with dpg.child_window(tag="Phonetic Options", show = False, height = 100, width = 600) as phonetic_selection_window:
-            dpg.add_text("Specify the word you want to phonetically match against")
-            dpg.add_input_text(tag = "phonetic_word", width = 500, height = 500, label = "String to match Phonetically")
-            dpg.add_button(tag="phonetic_constrained_button", label="Load Phonetically Matching Strings", callback=load_phonetic_callback)
-
-        dpg.add_checkbox(tag="semantic", label = "Semantic Matching", callback = semantic_callback)
-        _help("This uses fasttext word vectors to return strings which are semantically similar to the provided string")
-
-        with dpg.child_window(tag="Semantic Options", show = False, height = 100, width = 600) as semantic_selection_window:
-            dpg.add_text("Specify the word you want to semantically match against")
-            dpg.add_input_text(tag = "semantic_word", width = 500, height = 500, label = "String to match Semantically")
-            dpg.add_input_float(tag = "semantic_distance", label = "Similarity that the word has to be higher than")
-            dpg.add_button(tag="semantic_constrained_button", label="Load Semantic Matching Strings", callback=load_semantic_callback)
-
-        dpg.add_checkbox(tag="syllable", label = "Syllable Count", callback = syllable_callback)
-        _help("This will return strings with the specified number of syllables.")
-
-        with dpg.child_window(tag="Syllable Options", show = False, height = 100, width = 600) as syllable_selection_window:
-            dpg.add_text("Specify the number of Syllables you want in your word")
-            dpg.add_input_int(tag = "syllable_number", label = "Number of Syllables in word")
-            dpg.add_button(tag="syllable_constrained_button", label="Load Syllable Constrained Strings", callback=load_syllable_callback)
-
-        dpg.add_checkbox(tag="meter", label = "Meter", callback = meter_callback)
-        _help("This will return strings with the matching stress pattern of a passed in string, also called meter")
-
-        with dpg.child_window(tag="Meter Options", show = False, height = 100, width = 600) as meter_selection_window:
-            dpg.add_text("Specify the word whose meter you want to match")
-            dpg.add_input_text(tag = "meter_word", width = 500, height = 500, label = "String to match based on stress pattern")
-            dpg.add_button(tag="meter_constrained_button", label="Load Meter Constrained Strings", callback=load_meter_callback)
-
-        dpg.add_checkbox(tag="rhyme", label = "Rhyme", callback = rhyme_callback)
-        _help("This will return strings that rhyme with the provided string")
-
-        with dpg.child_window(tag="Rhyme Options", show = False, height = 100, width = 600) as rhyme_selection_window:
-            dpg.add_text("Specify the word which you want to rhyme with")
-            dpg.add_input_text(tag = "rhyme_word", width = 500, height = 500, label = "String to rhyme against")
-            dpg.add_button(tag="rhyme_constrained_button", label="Load Rhyming Constrained Strings", callback=load_rhyme_callback)
-
-                
-        dpg.add_checkbox(tag="palindrome", label = "Palindrome", callback = palindrome_callback)
-        _help("A palindrome is a string which reads the same backward as forward, such as madam or racecar")
-
-        with dpg.child_window(tag="Palindrome Options", show = False, height = 100, width = 600) as palindrome_selection_window:
-            dpg.add_text("Press the button to force all generated strings to be palindromes!")
-            dpg.add_button(tag="palindrome_button_enabled", label="Load Palindromic String", callback=load_palindrome_callback)
-
-
-
-        dpg.add_checkbox(tag="anagram", label = "Anagram", callback = anagram_callback)
-        _help("An anagram is a string formed by rearranging the letters of a different string")
-        with dpg.child_window(tag="Anagram Options", show = False, height = 100, width = 600) as anagram_selection_window:
-            dpg.add_text("Specify the string that you want generated strings to be anagrams of!")
-            dpg.add_input_text(tag = "anagram_string", width = 500, height = 500, label = "Anagram String")
-            dpg.add_button(tag="anagram_button", label="Load Anagramic String", callback=load_anagram_callback)
-
-        dpg.add_checkbox(tag="partial_anagram", label = "Partial Anagram", callback = partial_anagram_callback)
-        _help("A partial anagram is a string constructed by rearranging some or all of the letters of a different string")
-
-        with dpg.child_window(tag="Partial Anagram Options", show = False, height = 100, width = 600) as partial_anagram_selection_window:
-            dpg.add_text("Specify the string that you want generated strings to be partial anagrams of!")
-            dpg.add_input_text(tag = "partial_anagram_string", width = 500, height = 500, label = "Partial Anagram String")
-            dpg.add_button(tag="partial_anagram_button", label="Load Partial Anagramic String", callback=load_partial_anagram_callback)
-
-        dpg.add_checkbox(tag="isogram", label = "Isogram", callback = isogram_callback)
-        _help("An isogram is a string in which none of its characters appear more than the provided number of times")
-
-        with dpg.child_window(tag="Isogram Options", show = False, height = 100, width = 600) as isogram_window:
-            dpg.add_text("Specify the number of times characters are allowed to repeat")
-            dpg.add_input_int(tag = "isogram_number", label = "Number of times characters can repeat", default_value = 1)
-            dpg.add_button(tag="isogram_button", label="Load Isogramic String", callback=load_isogram_callback)
-
-        dpg.add_checkbox(tag="reverse_isogram", label = "Reverse Isogram", callback = reverse_isogram_callback)
-        _help("A reverse isogram is a string in which all of its characters appear more than the provided number of times")
-    
-        with dpg.child_window(tag="Reverse Isogram Options", show = False, height = 100, width = 600) as reverse_isogram_window:
-            dpg.add_text("Specify the number of times that characters must repeat")
-            dpg.add_input_int(tag = "reverse_isogram_number", label = "Number of times characters must repeat", default_value = 1)
-            dpg.add_button(tag="reverse_isogram_button", label="Load Reverse Isogramic String", callback=load_reverse_isogram_callback)
-        
-        dpg.add_button(tag="remove_filters", label = "Reset Filters", callback = turn_filters_off_callback)
-    
-
-    dpg.add_button(label="Predict New Tokens", callback=edit_string_callback)
-    dpg.add_button(label="AI generate some tokens", callback=generate_tokens_callback)
-    dpg.add_input_int(tag = "top_p", label = "Number of tokens for top P sampling", default_value = 0)
-    _help("Top-p sampling chooses from the smallest possible set of words whose cumulative probability exceeds the probability p")
-    dpg.add_input_int(tag = "top_k", label = "Number of tokens for top K sampling", default_value = 0)
-    _help("In Top-K sampling, the K most likely next words are filtered and the probability mass is redistributed among only those K next words.")
-    dpg.add_input_float(tag = "temperature", label = "Temperature", default_value = 1.0)
-    _help("lowering the so-called temperature increases the likelihood of high probability words and decreasing the likelihood of low probability words. Increasing does the opposite.")
-    dpg.add_input_int(tag = "num_tokens_to_generate", label = "Number of tokens to generate", default_value = 20)
-    _help("This only impacts how many tokens are generated by the AI generate some tokens button")
-    dpg.add_checkbox(tag="greedy_decoding", label = "Enable greedy decoding?")
-    _help("This will override top-p and top-k sampling and only select the most likely token everytime")
-    
-    with dpg.window(tag="Transforms", show=True, label="Text Transforms", no_close=True, width=window_size[0], height=window_size[1], pos=window_positions[3]) as pre_filter_options:
-        dpg.add_text("These are text transforms which will apply to all tokens *before* the actual filters are applied")
-        dpg.add_text("Using these transforms will frequently assist with increasing the vocabulary that is available after a filter is applied")
-        dpg.add_text("These transforms can also prevent generation of undesierable characters")
-        dpg.add_checkbox(tag="upper_case_transform", label = "Uppercase transform")
-        _help("Use this to cause all text to be UPPERCASED LIKE THIS")
-        dpg.add_checkbox(tag="lower_case_transform", label = "Lowercase transform")
-        _help("Use this to force all tokens to be lowercased like this")
-        dpg.add_checkbox(tag="replace_spaces", label = "Remove spaces")
-        _help("Use this to force all tokens to not have spaces likethis")
-        dpg.add_checkbox(tag = "lstrip_transform", label = "Left side strip")
-        _help("Use this to stip spaces from the left of the text")
-        dpg.add_checkbox(tag = "rstrip_transform", label = "Right side strip")
-        _help("Use this to stip spaces from the right of the text")
-        dpg.add_checkbox(tag = "strip_transform", label = "Full strip")
-        _help("Use this to stip spaces from both sides of the text")
-        dpg.add_checkbox(tag = "capitalize_first_letter_transform", label = "Capitalize the first letter")
-        _help("Use this to force all tokens to have their first letter capitalized Like This")
-        dpg.add_checkbox(tag = "alpha_numaric_transform", label = "Force tokens to be alpha numaric")
-        _help("Use this to force all tokens to be alphanumaric, meaning only using the alphabet or numbers")
-        dpg.add_checkbox(tag = "alpha_transform", label = "Force tokens to be alphaic")
-        _help("Use this to force all tokens to be alphaic, meaning only using the alphabet")
-        dpg.add_checkbox(tag = "digit_transform", label = "Force tokens to be digits")
-        _help("Use this to force all tokens to be digits, meaning only using numbers")
-        dpg.add_checkbox(tag = "ascii_transform", label = "Force tokens to be ascii characters")
-        _help("Use this to force all tokens to be ascii characters - to filter out unicode.")
-        dpg.add_checkbox(tag = "filter_blank_outputs", label = "Filter blank outputs")
-        _help("After applying some other transforms, there may be leftover blanks. This will remove them")
-
-    with dpg.window(tag="Readme", show=True, label="Read Me First", no_close=False, pos=readme_pos) as read_me_options:
-        dpg.add_text(default_value ="Usage tips:")
-        dpg.add_text(default_value="The first time you run this, it may take a few minutes to be ready to run because distilgpt2 and fasttext are being downloaded from huggingface. Wait until you see a messege in the Model Settings window about it being succesfully loaded before trying to run CTGS.", bullet = True)
-        dpg.add_text(default_value ="Right click anywhere within the text box for a list of continuations with the enabled filters to appear", bullet = True)
-        dpg.add_text(default_value ="The F1 key generates new tokens given the context (populates the right click continuations box), and is equivilant to the Predict New Tokens button", bullet = True)
-        dpg.add_text(default_value ="The F2 key directly inserts the next token into the text box using the models decoder (and top_p, top_k, temperature) settings. It's equivilant to the AI generate some tokens button", bullet = True)
-        dpg.add_text(default_value="If you're not seeing continuations using F2 or the ai generate some token button, make sure that it's not generating spaces, line returns, or other blank characters", bullet = True)
-        dpg.add_text(default_value="Use the text transforms list to apply transforms to the vocabulary before the constraints are applied. To mitigate the problem of the LM generating spaces, you could for example use the filter blank outputs transform", bullet = True)
-        dpg.add_text(default_value="After typing or copying/pasting text into the text box, use the Predict New Tokens button or F1 to get new continuations (what you see when you right click) given your context.", bullet = True)
-        dpg.add_text(default_value="After publication, I intend to open source this. In the next release, I will add support for BERT/Masked Language Models. I've already tested and know they work using this technique in principle.")
-        dpg.add_text(default_value = "This utility is written using the DearPyGUI GUI library, and has the tiling mode enabled. You can move around the windows and tile them with each other to your hearts desire. I think a tool like this is a natural fit for a tiling window manager style layout")
-        dpg.add_text(default_value = "Hovering over a green question-mark will pop-up a tooltip to give you context/help")
-        dpg.add_text(default_value = "This window can be closed with the X in the top right")
-
-
-with dpg.handler_registry():
-    dpg.add_key_press_handler(key = 113, callback=tab_key_generate_tokens_callback) ##F2 inserts most likely token
-    dpg.add_key_press_handler(key = 112, callback=edit_string_callback) ##F1 generates new tokens
-
-load_model(the_name="EleutherAI/pythia-1b")
-
-edit_string_callback()
-dpg.set_global_font_scale(1.0)
-#dpg.toggle_viewport_fullscreen()
-dpg.show_viewport()
-#dpg.set_primary_window("main_window", True)
-dpg.start_dearpygui()
-dpg.destroy_context()
-
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Predict New Tokens (F1)", callback=refresh_token_popup)
+            dpg.add_button(label="Generate Tokens (F2)", callback=generate_tokens_callback)
+
+        dpg.add_separator()
+        dpg.add_text("Sampling Settings")
+        dpg.add_slider_float(tag="top_p", label="Top-P (nucleus sampling)",
+                             default_value=0.0, min_value=0.0, max_value=1.0, format="%.2f")
+        _help("Top-p sampling chooses from the smallest set of words whose cumulative probability exceeds p. 0 = disabled.")
+        dpg.add_input_int(tag="top_k", label="Top-K sampling", default_value=0, min_value=0)
+        _help("Top-K keeps only the K most likely next words. 0 = disabled.")
+        dpg.add_slider_float(tag="temperature", label="Temperature",
+                             default_value=1.0, min_value=0.1, max_value=3.0, format="%.2f")
+        _help("Lower = more deterministic, higher = more random.")
+        dpg.add_input_int(tag="num_tokens_to_generate", label="Tokens to generate",
+                          default_value=20, min_value=1)
+        dpg.add_checkbox(tag="greedy_decoding", label="Greedy decoding")
+        _help("Always select the most likely token (overrides top-p/top-k).")
+
+        dpg.add_separator()
+        dpg.add_text("Constraint Engine Settings")
+        dpg.add_slider_float(tag="constraint_strength", label="Constraint Strength",
+                             default_value=1.0, min_value=0.0, max_value=1.0, format="%.2f")
+        _help("1.0 = hard filter (pass/fail). Lower values apply soft penalties instead, "
+              "allowing near-misses with reduced probability. Prevents vocabulary crippling.")
+        dpg.add_checkbox(tag="progressive_relaxation", label="Progressive relaxation", default_value=True)
+        _help("When enabled, automatically expands the candidate pool if constraints filter out all tokens "
+              "at the current top-k/top-p level.")
+        dpg.add_input_int(tag="max_backtracks", label="Max backtracks",
+                          default_value=3, min_value=0, max_value=50)
+        _help("During multi-token generation, backtrack this many times on dead ends to try alternative tokens.")
+
+        dpg.add_separator()
+        dpg.add_text("Active Filters:")
+        with dpg.group(tag="active_filters"):
+            pass
+
+    # --- Model Settings Window ---
+    with dpg.window(tag="model_window", label="Model Settings",
+                    no_close=True, width=w, height=h, pos=(w, h)):
+        dpg.add_text("Load a causal language model from HuggingFace for text generation")
+        _help("Make sure torch.cuda.is_available() returns True for GPU acceleration!")
+        dpg.add_input_text(tag="model_name", width=-100, default_value="EleutherAI/pythia-1b",
+                           label="HuggingFace Model")
+        dpg.add_combo(items=["32bit", "16bit", "8bit"], tag="precision",
+                      label="Precision", default_value="32bit")
+        dpg.add_button(tag="load_model_btn", label="Load Model", callback=load_model_callback)
+        _help("Downloads the model from HuggingFace. Check terminal for download progress.")
+        dpg.add_loading_indicator(tag="model_loading_indicator", show=False,
+                                  style=0, radius=2.0, color=(60, 110, 160))
+        dpg.add_text(tag="model_status", default_value="No model loaded", color=[200, 200, 100])
+
+    # --- Filter Options Window ---
+    with dpg.window(tag="filter_window", label="Filters",
+                    no_close=True, width=w, height=h, pos=(w, 0)):
+        dpg.add_text("Select and configure constraint filters")
+
+        with dpg.tab_bar(tag="filter_tabs"):
+            build_all_constraints("filter_tabs")
+
+        dpg.add_separator()
+        dpg.add_button(tag="reset_filters_btn", label="Reset All Filters",
+                       callback=turn_filters_off_callback)
+
+    # --- Text Transforms Window ---
+    with dpg.window(tag="transforms_window", label="Text Transforms",
+                    no_close=True, width=w, height=h, pos=(0, h)):
+        dpg.add_text("Transforms applied to all tokens BEFORE constraint filtering")
+        dpg.add_text("Using transforms increases the vocabulary that survives filtering", color=[180, 180, 180])
+        dpg.add_separator()
+        dpg.add_checkbox(tag="upper_case_transform", label="Uppercase")
+        _help("Force all tokens to UPPERCASE")
+        dpg.add_checkbox(tag="lower_case_transform", label="Lowercase")
+        _help("Force all tokens to lowercase")
+        dpg.add_checkbox(tag="replace_spaces", label="Remove spaces")
+        _help("Remove all spaces from tokens")
+        dpg.add_checkbox(tag="lstrip_transform", label="Left strip")
+        _help("Strip whitespace from the left side")
+        dpg.add_checkbox(tag="rstrip_transform", label="Right strip")
+        _help("Strip whitespace from the right side")
+        dpg.add_checkbox(tag="strip_transform", label="Full strip")
+        _help("Strip whitespace from both sides")
+        dpg.add_checkbox(tag="capitalize_first_letter_transform", label="Capitalize first letter")
+        _help("Capitalize the first letter of each token")
+        dpg.add_checkbox(tag="alphanumeric_transform", label="Alphanumeric only")
+        _help("Keep only letters and numbers")
+        dpg.add_checkbox(tag="alpha_transform", label="Alphabetic only")
+        _help("Keep only letters")
+        dpg.add_checkbox(tag="digit_transform", label="Digits only")
+        _help("Keep only numbers")
+        dpg.add_checkbox(tag="ascii_transform", label="ASCII only")
+        _help("Filter out non-ASCII/unicode characters")
+        dpg.add_checkbox(tag="filter_blank_outputs", label="Filter blanks")
+        _help("Remove tokens that become empty after transforms")
+
+    # --- Help / Readme Window ---
+    readme_pos = (screen_width // 4, screen_height // 4)
+    with dpg.window(tag="readme_window", label="Quick Start Guide",
+                    no_close=False, width=w, height=h, pos=readme_pos, show=True):
+        dpg.add_text("Usage Tips:", color=[120, 200, 255])
+        dpg.add_text("The first time you run CTGS, model downloads may take several minutes. "
+                      "Check the Model Settings window for loading status.", bullet=True)
+        dpg.add_text("Right-click in the text box to see AI-suggested continuations "
+                      "with your constraints applied.", bullet=True)
+        dpg.add_text("F1 refreshes token predictions (same as 'Predict New Tokens' button).", bullet=True)
+        dpg.add_text("F2 inserts a single token directly (same as 'Generate Tokens' with count=1).", bullet=True)
+        dpg.add_text("Use Text Transforms to normalize tokens before filtering. "
+                      "'Full strip' + 'Filter blanks' is recommended as a baseline.", bullet=True)
+        dpg.add_text("The Constraint Strength slider lets you use soft penalties "
+                      "instead of hard bans, preventing vocabulary crippling.", bullet=True)
+        dpg.add_text("Progressive Relaxation automatically expands the candidate pool "
+                      "when constraints are too strict.", bullet=True)
+        dpg.add_text("Backtracking lets multi-token generation recover from dead ends "
+                      "by trying alternative tokens at previous steps.", bullet=True)
+        dpg.add_separator()
+        dpg.add_text("Windows can be rearranged, docked, and tiled. "
+                      "Hover over green (?) icons for context help.")
+        dpg.add_text("Close this window with the X button.")
+
+    # --- Key Bindings ---
+    with dpg.handler_registry():
+        dpg.add_key_press_handler(key=dpg.mvKey_F1, callback=refresh_token_popup)
+        dpg.add_key_press_handler(key=dpg.mvKey_F2, callback=tab_key_generate_callback)
+
+    # --- Start ---
+    dpg.set_global_font_scale(1.0)
+    dpg.show_viewport()
+
+    # Load default model in background
+    load_model_callback(model_name_override="EleutherAI/pythia-1b")
+
+    dpg.start_dearpygui()
+    dpg.destroy_context()
+
+
+if __name__ == "__main__":
+    main()
