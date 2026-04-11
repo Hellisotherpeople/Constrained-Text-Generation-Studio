@@ -272,7 +272,9 @@ def get_constrained_tokens(sequence):
                 pass
 
             outputs = model_state.model(input_ids)
-            raw_logits = outputs.logits[:, -1, :]
+            # Move logits to CPU immediately to free GPU memory
+            raw_logits = outputs.logits[:, -1, :].float().cpu()
+            del outputs
 
             temperature = dpg.get_value("temperature")
             if temperature > 0 and temperature != 1.0:
@@ -280,6 +282,10 @@ def get_constrained_tokens(sequence):
 
             top_p = dpg.get_value("top_p")
             top_k = dpg.get_value("top_k")
+            # If user left both at 0 (no filtering), use a sensible default
+            # to avoid processing the entire 50k+ token vocabulary
+            if top_k == 0 and top_p == 0.0:
+                top_k = 500
             strength = dpg.get_value("constraint_strength")
             use_relaxation = dpg.get_value("progressive_relaxation")
             has_constraints = constraints.has_active_constraints()
@@ -289,19 +295,27 @@ def get_constrained_tokens(sequence):
             else:
                 levels = [(top_k, top_p)]
 
+            filter_blanks = dpg.get_value("filter_blank_outputs")
+
             for eff_k, eff_p in levels:
                 logits = apply_top_k_top_p(raw_logits, top_k=eff_k, top_p=eff_p)
-                probs = F.softmax(logits.float(), dim=-1).sort(descending=True)
+                probs = F.softmax(logits, dim=-1)
+
+                # Only decode tokens with non-zero probability (avoids decoding entire vocab)
+                nonzero_mask = probs[0] > 0
+                nonzero_indices = nonzero_mask.nonzero(as_tuple=True)[0]
+                nonzero_probs = probs[0][nonzero_indices]
+
+                # Sort by probability descending
+                sorted_order = nonzero_probs.argsort(descending=True)
+                sorted_indices = nonzero_indices[sorted_order]
+                sorted_probs = nonzero_probs[sorted_order]
+
+                decoded = model_state.tokenizer.batch_decode(sorted_indices)
 
                 word_list = []
-                decoded = model_state.tokenizer.batch_decode(probs[1][0])
-                filter_blanks = dpg.get_value("filter_blank_outputs")
-
                 for i, raw_text in enumerate(decoded):
-                    prob = probs[0][0][i].item()
-                    if prob <= 0:
-                        break  # remaining tokens have zero probability
-
+                    prob = sorted_probs[i].item()
                     text = apply_text_transforms(raw_text)
                     if filter_blanks and text == "":
                         continue
@@ -501,16 +515,36 @@ def load_model_callback(sender=None, app_data=None, user_data=None, model_name_o
         try:
             precision = dpg.get_value("precision")
             model_state.tokenizer = AutoTokenizer.from_pretrained(model_name)
-            kwargs = {"device_map": "auto"}
-            if precision == "8bit":
-                kwargs["load_in_8bit"] = True
-            elif precision == "16bit":
-                kwargs["torch_dtype"] = torch.float16
-            model_state.model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
-            model_state.name = model_name
 
-            device = "GPU" if torch.cuda.is_available() else "CPU"
-            dpg.set_value("model_status", f"{model_name} loaded on {device} ({precision})")
+            dtype = None
+            if precision == "16bit":
+                dtype = torch.float16
+
+            if torch.cuda.is_available():
+                kwargs = {"device_map": "auto"}
+                if precision == "8bit":
+                    kwargs["load_in_8bit"] = True
+                if dtype:
+                    kwargs["torch_dtype"] = dtype
+                model_state.model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+                device_label = "CUDA GPU"
+            elif torch.backends.mps.is_available():
+                # MPS (Apple Silicon): load to CPU first, then move to MPS
+                # device_map='auto' doesn't handle MPS well
+                load_dtype = dtype or torch.float32
+                model_state.model = AutoModelForCausalLM.from_pretrained(
+                    model_name, torch_dtype=load_dtype
+                ).to("mps")
+                device_label = "MPS (Apple Silicon)"
+            else:
+                load_dtype = dtype or torch.float32
+                model_state.model = AutoModelForCausalLM.from_pretrained(
+                    model_name, torch_dtype=load_dtype
+                )
+                device_label = "CPU"
+
+            model_state.name = model_name
+            dpg.set_value("model_status", f"{model_name} loaded on {device_label} ({precision})")
         except Exception as e:
             dpg.set_value("model_status", f"Error: {e}")
         finally:
