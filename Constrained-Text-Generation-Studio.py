@@ -835,6 +835,7 @@ def main():
 
     # --- DearPyGUI Setup ---
     dpg.create_context()
+    dpg.configure_app(docking=True, docking_space=True)
 
     monitor = get_monitors()[0]
     screen_width = monitor.width
@@ -843,7 +844,6 @@ def main():
     dpg.create_viewport(title="CTGS - Constrained Text Generation Studio",
                         width=screen_width, height=screen_height)
     dpg.setup_dearpygui()
-    dpg.enable_docking(dock_space=True)
 
     # Font (with fallback)
     font_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
