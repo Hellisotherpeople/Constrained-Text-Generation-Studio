@@ -688,8 +688,10 @@ def _refresh_bar_chart():
     tick_labels = []
 
     for i, (text, prob) in enumerate(top_n):
-        label = text.replace(" ", "\u2423").replace("\n", "\\n")[:12]
-        tick_labels.append((label, float(i)))
+        label = text.replace(" ", "_").replace("\n", "NL").replace("\r", "")[:12]
+        if not label:
+            label = f"[{i}]"
+        tick_labels.append((str(label), float(i)))
         if text in passing_set:
             pass_x.append(float(i))
             pass_y.append(prob)
@@ -706,8 +708,8 @@ def _refresh_bar_chart():
         if dpg.does_item_exist("red_bar_theme"):
             dpg.bind_item_theme("bar_fail_s", "red_bar_theme")
 
-    if dpg.does_item_exist("prob_bar_x"):
-        dpg.set_axis_ticks("prob_bar_x", tick_labels)
+    if dpg.does_item_exist("prob_bar_x") and tick_labels:
+        dpg.set_axis_ticks("prob_bar_x", tuple(tick_labels))
 
 
 def _refresh_pie_chart():
@@ -813,9 +815,14 @@ def _refresh_history_plot(*args):
     if bt_xs:
         dpg.add_scatter_series(bt_xs, bt_ys, label="Backtrack", parent="history_y")
 
-    tick_labels = [(h[0].replace(" ", "")[:8], float(i)) for i, h in enumerate(hist)]
+    tick_labels = []
+    for i, h in enumerate(hist):
+        label = h[0].replace(" ", "_").replace("\n", "")[:8]
+        if not label:
+            label = f"[{i}]"
+        tick_labels.append((str(label), float(i)))
     if tick_labels and dpg.does_item_exist("history_x"):
-        dpg.set_axis_ticks("history_x", tick_labels)
+        dpg.set_axis_ticks("history_x", tuple(tick_labels))
 
 
 def _save_text_callback(sender, app_data):
