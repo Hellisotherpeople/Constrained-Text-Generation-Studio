@@ -1141,7 +1141,7 @@ def main():
 
     # --- DearPyGUI Setup ---
     dpg.create_context()
-    dpg.configure_app(docking=True, docking_space=True)
+    dpg.configure_app(docking=False, docking_space=False)
 
     monitor = get_monitors()[0]
     screen_width = monitor.width
